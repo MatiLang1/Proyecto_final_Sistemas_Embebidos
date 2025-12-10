@@ -16,9 +16,9 @@ volatile uint8_t lcd_mode = 0;
 volatile uint8_t history_index = 0; // Índice de la muestra histórica a mostrar (0-9)
 volatile uint8_t eeprom_address_index = 0; // Índice de la última muestra guardada (0-9)
 
-// Variables de interrupción (Mantenidas a nivel de registros)
-volatile uint16_t adc_values[3] = {0,0,0}; 
-volatile uint8_t current_channel = 0;
+// Variables de interrupciones
+volatile uint16_t adc_values[3] = {0,0,0}; //Es un array para guardar las lecturas de los 3 sensores, es volatile porque se llena dentro de una interrupción y se lee en el loop
+volatile uint8_t current_channel = 0; //Lleva la cuenta de qué sensor se está leyendo (0, 1 o 2)
 volatile bool alarma_activa = false;
 volatile bool silencio = false;
 
@@ -27,15 +27,16 @@ volatile bool silencio = false;
 
 // Configurar ADC en modo Free-Running con interrupciones
 void adc_init() {
-    ADMUX = (1 << REFS0);       // Selecciona a VCC (5V) como voltaje de referencia, canal ADC0 inicialmente
-    ADCSRA = (1 << ADEN) |      // Habilita el ADC
-             (1 << ADATE) |     // Habilita elAuto trigger (disparo automático)
-             (1 << ADIE) |      // Habilita la Interrupción del ADC. Esto es clave porque cada vez que termine una conversión, se ejecuta la función ISR(ADC_vect)
+    ADMUX = (1 << REFS0);       // Selecciona a VCC (5V) como voltaje de referencia para q el ADC sepa que el max es 1023, inicialmente apunta al canal 0 (ADC0)
+    ADCSRA = (1 << ADEN) |      // Prende el ADC
+
+             (1 << ADATE) |     // Habilita el Auto trigger (disparo automático), significa que cuando termina una conversión, puede arrancar otra automáticamente
+
+             (1 << ADIE) |      // Habilita la Interrupción del ADC. Esto es clave porque cada vez que termine de medir y hacer la conversión, se ejecuta la función ISR(ADC_vect)
 
              (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // Configura el Prescaler a 128. Configurar el prescaler a 128 en los registros del Arduino tiene un impacto en la Frecuencia de funcionamiento de componentes específicos del microcontrolador (como en el ADC o los Timers/Contadores). El prescaler es un divisor de frecuencia, toma la señal del reloj principal del Arduino (16 MHz) y la divide por un factor preestablecido (128 en este caso)
              
     ADCSRB = 0x00; // Selecciona el modo "Free Running". En cuanto termina una conversión, inicia la siguiente inmediatamente. Tan pronto como el ADC termina de convertir la lectura de un pin analógico (ej el A0) y el resultado se guarda en el registro de datos, el ADC se dispara automáticamente (inicia) la siguiente conversión sin necesidad de una nueva instrucción de software o un evento externo
-
     //Free Running se refiere a la configuración del Modo de Disparo (Trigger Mode) del ADC en el Arduino. ADCSRB = 0x00; hace lo siguiente: Modo Seleccionado: "Free Running" (Funcionamiento Libre)
     // Al escribir 0x00  en el registro ADCSRB (ADC Control and Status Register B), se configuran los bits ADTS2:0 (ADC Auto Trigger Source) a 000. Este valor 000 corresponde al modo Free Running.
 
@@ -47,21 +48,35 @@ void adc_init() {
         // 2 - Acción: Iniciar la Conversión(1 << ADSC): Crea una máscara binaria donde solo el bit ADSC está en 1. |=: Es el operador OR a nivel de bits (Bitwise OR) y asignación. Lo que hace es establecer (poner en 1) el bit ADSC sin modificar el estado de ningún otro bit en el registro ADCSRA.El Efecto: Al establecer el bit ADSC a 1, le estás dando la orden al hardware del microcontrolador de Iniciar la Conversión Analógica-Digital
 }
 
-// Configurar TIMER1 a 10 ms
+
+// La funcion timer1_init ejecuta la función ISR (para hacer la interrupcion) cada vez que el Timer 1 cuenta 20.000 pulsos de su reloj pre-escalado
+// Se usa el Timer1 (16 bits) para generar una base de tiempo exacta de 10ms (100 Hz)
+// Modo CTC (Clear Timer on Compare Match):
+    // TCCR1B = (1 << WGM12): El timer cuenta hasta un valor tope y se reinicia
+// Prescaler:
+        // TCCR1B |= (1 << CS11): Divide el reloj principal por 8 (16MHz / 8 = 2MHz)
+// Valor de Comparación (Tope):
+    // OCR1A = 20000: Con el reloj a 2MHz, contar 20000 pulsos toma 10ms (20.000/2.000.000 = 0.01s)
+// Interrupción:
+    // TIMSK1 = (1 << OCIE1A): Habilita la interrupción cuando el timer llega a 20.000 pulsos para ello Ejecuta ISR(TIMER1_COMPA_vect)
 void timer1_init() {
     TCCR1A = 0x00;
-    TCCR1B = (1 << WGM12) | (1 << CS11); // CTC, prescaler 8
+    TCCR1B = (1 << WGM12) | (1 << CS11); // Activa el modo CTC (Clear Timer on Compare Match). El timer cuenta desde 0 hasta el valor de OCR1A. Cuando llega (es pq matcheo el valor del timer 1 "TCNT1" con el valor de OCR1A), el contador del timer vuelve a 0 automáticamente
     OCR1A = 20000; // 16MHz / (8*100) = 20000 (100 Hz -> 10 ms)
-    TIMSK1 = (1 << OCIE1A);
+    TIMSK1 = (1 << OCIE1A); // Habilita la interrupción, cuando el contador llega a 20000 ejecuta la ISR(TIMER1_COMPA_vect)
+
 }
 
-// Interrupción por cambio de pin en D8 (PCINT0)
+// Interrupción externa realizada por Boton/Pulsador - por cambio de estado en el pin D8 (PCINT0)
+// Esta funcion se usa para detectar el botón en el pin digital 8 (Puerto B, bit 0)
+    // PCICR |= (1 << PCIE0): Habilita el grupo de interrupciones 0 (que controla los pines D8 a D13)
+    // PCMSK0 |= (1 << PCINT0): Habilita específicamente la interrupción para el pin D8. Cualquier cambio de estado (LOW a HIGH o viceversa) dispara ISR(PCINT0_vect) la cual es la función que se ejecuta cuando se produce la interrupción
 void pcint_init() {
-    PCICR |= (1 << PCIE0);    // Grupo PCINT0 (pines 8–13)
-    PCMSK0 |= (1 << PCINT0); // Habilitar PCINT0 (D8)
+    PCICR |= (1 << PCIE0);    // Habilita el Grupo 0 de interrupciones, que corresponde a los pines D8 hasta D13 (Puerto B)
+    PCMSK0 |= (1 << PCINT0); // Dentro de ese grupo, habilita específicamente el pin D8. Si el estado del pin 8 cambia (0 a 1 o 1 a 0), se dispara la interrupción
 }
 
-// SETUP, LOOP e ISRs
+// SETUP (definimos pines de entrada/salida, inicializamos perifericos y habilitamos interrupciones globales)
 
 void setup() {
     // Inicialización LCD I2C (Alto Nivel)
@@ -69,11 +84,12 @@ void setup() {
     lcd.backlight();
     lcd.print("Monitoreo Amb.");
 
-    // Pines de salida
+    // PINES DE SALIDA
+    // (Data Direction Register) configura si un pin es entrada (0) o salida (1). Aca ponemos los bits 4, 5 y 6 del Puerto D como Salidas (para LEDs y Buzzer)
     DDRD |= (1 << DDD4) | (1 << DDD5) | (1 << DDD6);
 
-    // Pin del botón (D8)
-    DDRB &= ~(1 << DDB0); // D8 como entrada
+    // PINES DE ENTRADA
+    DDRB &= ~(1 << DDB0); // Pone el bit 0 del Puerto B (Pin 8) como Entrada (el del Boton/Pulsador)
 
     adc_init();
     timer1_init();
@@ -81,6 +97,7 @@ void setup() {
 
     sei(); // Habilitar interrupciones globales
 }
+
 
 // LOOP (Muestra los valores en la pantalla LCD)
 void loop() {
@@ -91,19 +108,19 @@ void loop() {
     }
 
     if (lcd_mode == 0) {
-        // --- MODO 0: TIEMPO REAL ---
+        // LCD en Modo 0: Valores de sensores en tiempo real
         uint16_t temp = adc_values[0];
         uint16_t luz  = adc_values[1];
         uint16_t nivel = adc_values[2];
         
         lcd.setCursor(0, 0); 
-        lcd.print("T:");
+        lcd.print("T: ");
         lcd.print(temp);
-        lcd.print("  L:");
+        lcd.print("   L: ");
         lcd.print(luz);
         
         lcd.setCursor(0, 1);
-        lcd.print("N:");Sampl
+        lcd.print("N: ");
         lcd.print(nivel);
         lcd.print(" ");
         
@@ -115,39 +132,54 @@ void loop() {
             lcd.print("OK      "); 
         }
     } else {
-        // LCD en Modo 1: Historico de muestras (Lectura simple con EEPROM.get())
+        // LCD en Modo 1: Historico de muestras (Leemos los valores de la EEPROM con EEPROM.get())
         
+
+        // Calculamos la dirección base de la EEPROM (para determinar la dirección de memoria exacta en la EEPROM donde se deben guardar/leer los datos)
+        // Permite el acceso secuencial a registros de datos que tienen un tamaño fijo dentro de la EEPROM. El valor de base_addr es la dirección de la primera celda de memoria de la EEPROM donde se almacena el conjunto de datos correspondiente a ese índice histórico
         uint16_t base_addr = EEPROM_START_ADDR + (history_index * BYTES_PER_SAMPLE);
-        
-        // Estructura temporal para leer 6 bytes de golpe
-        struct Sample {
+
+
+
+        // Estructura para leer 6 bytes juntos (la muestra entera con los valores de los 3 sensores)
+        // Creamos la estructura "Muestra" con los campos t (temperatura), l (luz) y n (nivel), luego creamos la variable "h_data" de tipo "Muestra"
+        struct Muestra {
             uint16_t t;
             uint16_t l;
             uint16_t n;
         } h_data;
 
-        // Lectura de EEPROM usando la librería simple
+
+        // Usando el metodo GET, Leemos la muestra completa de 6 bytes (t, l, y n) de la EEPROM a partir de la direccion "base_addr" y la cargamos en el objeto "h_data" (h_data es una instancia de la struct "Muestra")
         EEPROM.get(base_addr, h_data);
         
         lcd.setCursor(0, 0);
         lcd.print("REG: ");
-        lcd.print(history_index + 1); // Muestra 1-10
-        lcd.print("/10 T:");
-        lcd.print(h_data.t);
+        lcd.print(history_index + 1); // Muestras 1-10 (sumamos 1 pq el indice arranca en 0)
+        lcd.print("/10 T: ");
+        lcd.print(h_data.t); // Muestra la temperatura (el campo t de la estructura h_data)
         
         lcd.setCursor(0, 1);
-        lcd.print("L:");
-        lcd.print(h_data.l);
-        lcd.print(" N:");
-        lcd.print(h_data.n);
+        lcd.print("L: ");
+        lcd.print(h_data.l); // Muestra la luz (el campo l de la estructura h_data)
+        lcd.print(" N: ");
+        lcd.print(h_data.n); // Muestra el nivel (el campo n de la estructura h_data)
     }
     
     // Retardo para no saturar la comunicación I2C (POSIBLEMENTE CAMBIAR A FUNCION MILLIS)
     delay(200); 
 }
 
-// ISR ADC
+
+// Rutina = lo q se ejecuta cuando se da una interrupcion
+// La rutina es el codigo de una funcion q se ejecuta cuando sucede una interrupcion, en este caso ISR(ADC_vect) es la funcion q se ejecuta cuando se da la interrupcion del ADC
+
+//ISR(ADC_vect) - Muestreo Rotativo: esta rutina se ejecuta automaticamente al finalizar la interrupcion del ADC (la que toma valores y hace la conversion ADC)
+// ISR(ADC_vect) hace la Rotación del Canal para tomar los valores de los 3 sensores uno a la vez (usando un canal analogico para cada sensor)
+// Esta rutina permite que los 3 sensores se actualicen constantemente de fondo/en segundo plano mediante interrupciones ISR sin q el loop haga nada, asi el loop() principal esta libre para manejar otras tareas sin preocuparse por los tiempos de espera de las lecturas de los sensores
 ISR(ADC_vect) {
+
+    // "Lectura": lee el valor del registro ADC y lo guarda en el array "adc_values"
     uint16_t lectura = ADC;
     adc_values[current_channel] = lectura;
     
@@ -156,13 +188,14 @@ ISR(ADC_vect) {
     if (current_channel >= 3) current_channel = 0;
     
     ADMUX = (1 << REFS0) | current_channel;
+    // Reconfiguración: escribe en ADMUX el nuevo canal (como el ADC está en modo Free-Running, la siguiente conversion que inicie automaticamente, usará este nuevo canal)
 }
 
 // ISR TIMER1 (Lógica de Alarma y Guardado Periódico)
 ISR(TIMER1_COMPA_vect) {
     static uint8_t counter_1s = 0;
     
-    // --- Lógica de Alarma (igual que antes) ---
+    // Logica de Alarma
     uint16_t temp = adc_values[0];
     uint16_t luz  = adc_values[1];
     uint16_t nivel = adc_values[2];
@@ -226,288 +259,3 @@ ISR(PCINT0_vect) {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-// // Codigo con interrupciones, registros e I2C
-// #include <LiquidCrystal_I2C.h> // Necesitas instalar esta librería (ej. desde el Gestor de Librerías)
-
-// // Definiciones de la LCD I2C
-// // Ajusta la dirección (0x27 o 0x3F) y el tamaño (16x2) según tu módulo
-// LiquidCrystal_I2C lcd(0x27, 16, 2); 
-
-// // Variables globales
-// volatile uint16_t adc_values[3] = {0,0,0}; 
-// volatile uint8_t current_channel = 0;
-// volatile bool alarma_activa = false;
-// volatile bool silencio = false;
-
-// // Configurar ADC en modo Free-Running con interrupciones
-// void adc_init() {
-//     ADMUX = (1 << REFS0);       // Referencia AVcc, canal ADC0 inicialmente
-//     ADCSRA = (1 << ADEN) |      // Habilitar ADC
-//              (1 << ADATE) |     // Auto trigger
-//              (1 << ADIE) |      // Interrupción ADC
-//              (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // Prescaler 128
-//     ADCSRB = 0x00;              // Free running mode
-//     ADCSRA |= (1 << ADSC);      // Start conversion
-// }
-
-// // Configurar TIMER1 a 10 ms
-// void timer1_init() {
-//     TCCR1A = 0x00;
-//     TCCR1B = (1 << WGM12) | (1 << CS11); // CTC, prescaler 8
-//     OCR1A = 20000; // (F_CPU / (prescaler * 100 Hz)) = (16MHz / (8*100)) = 20000
-//     TIMSK1 = (1 << OCIE1A);
-// }
-
-// // Interrupción por cambio de pin en D8 (PCINT0)
-// void pcint_init() {
-//     PCICR |= (1 << PCIE0);    // Grupo PCINT0 (pines 8–13)
-//     PCMSK0 |= (1 << PCINT0); // Habilitar PCINT0 (D8)
-// }
-
-// // SETUP
-// void setup() {
-
-//     // Inicialización LCD I2C (Alto Nivel)
-//     lcd.init();
-//     lcd.backlight();
-//     lcd.print("Monitoreo Amb.");
-
-//     // Pines de salida
-//     DDRD |= (1 << DDD4) | (1 << DDD5) | (1 << DDD6);
-
-//     // Pin del botón
-//     DDRB &= ~(1 << DDB0); // D8 como entrada
-
-//     adc_init();
-//     timer1_init();
-//     pcint_init();
-
-//     sei(); // Habilitar interrupciones globales
-// }
-
-// // LOOP (Muestra los valores en la LCD)
-// void loop() {
-    
-//     // Muestra la actividad mínima (apagar el buzzer)
-//     if (silencio) {
-//         PORTD &= ~(1 << PORTD6); // apagar buzzer
-//     }
-
-//     // --- LÓGICA DE ACTUALIZACIÓN DE LCD (Alto Nivel) ---
-    
-//     // Lee los valores actuales (copia atómica fuera del ISR)
-//     uint16_t temp = adc_values[0];
-//     uint16_t luz  = adc_values[1];
-//     uint16_t nivel = adc_values[2];
-    
-//     // Linea 1: Temperatura y Luz
-//     lcd.setCursor(0, 0); 
-//     lcd.print("T:");
-//     lcd.print(temp);
-//     lcd.print("  L:");
-//     lcd.print(luz);
-    
-//     // Linea 2: Nivel y Estado de Alarma
-//     lcd.setCursor(0, 1);
-//     lcd.print("N:");
-//     lcd.print(nivel);
-//     lcd.print(" ");
-    
-//     if (silencio) {
-//         lcd.print("SILENCIO");
-//     } else if (alarma_activa) {
-//         lcd.print("ALERTA! ");
-//     } else {
-//         lcd.print("OK      "); // Rellenar con espacios para borrar "ALERTA"
-//     }
-    
-//     // Pequeño retardo para no saturar la comunicación I2C
-//     delay(200); 
-// }
-
-// // ISR ADC
-// ISR(ADC_vect) {
-//     uint16_t lectura = ADC;
-//     adc_values[current_channel] = lectura;
-    
-//     // Avanzar al siguiente canal
-//     current_channel++;
-//     if (current_channel >= 3) current_channel = 0;
-    
-//     ADMUX = (1 << REFS0) | current_channel; 
-// }
-
-// // ISR TIMER1 (Actualiza la variable de estado 'alarma_activa')
-// ISR(TIMER1_COMPA_vect) {
-
-//     uint16_t temp = adc_values[0];
-//     uint16_t luz  = adc_values[1];
-//     uint16_t nivel = adc_values[2];
-
-//     bool alerta = false;
-
-//     if (temp > 500) { // temp alta
-//         PORTD |= (1 << PORTD4); 
-//         alerta = true;
-//     } else {
-//         PORTD &= ~(1 << PORTD4);
-//     }
-
-//     if (luz < 200) { // baja luz
-//         PORTD |= (1 << PORTD5);
-//     } else {
-//         PORTD &= ~(1 << PORTD5);
-//     }
-
-//     if (nivel > 600) { // nivel alto
-//         PORTD |= (1 << PORTD4); // Reutilizo el LED de temp alta
-//         alerta = true;
-//     }
-
-//     alarma_activa = alerta; // Actualiza la variable global para que el loop la use
-
-//     if (alerta && !silencio) {
-//         PORTD |= (1 << PORTD6); // buzzer
-//     } else {
-//         PORTD &= ~(1 << PORTD6);
-//     }
-// }
-
-// // ISR PCINT0 - Botón
-// ISR(PCINT0_vect) {
-//     silencio = true; // apaga alarmas inmediatamente
-// }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-// // Codigo sin I2C
-// // Variables globales
-// volatile uint16_t adc_values[3] = {0,0,0}; 
-// volatile uint8_t current_channel = 0;
-// // volatile bool alarma_activa = false;
-// volatile bool silencio = false;
-
-// // Configurar ADC en modo Free-Running con interrupciones
-// void adc_init() {
-//     ADMUX = (1 << REFS0);          // Referencia AVcc, canal ADC0 inicialmente
-//     ADCSRA = (1 << ADEN) |         // Habilitar ADC
-//              (1 << ADATE) |        // Auto trigger
-//              (1 << ADIE) |         // Interrupción ADC
-//              (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // Prescaler 128
-//     ADCSRB = 0x00;                 // Free running mode
-//     ADCSRA |= (1 << ADSC);         // Start conversion
-// }
-
-// // Configurar TIMER1 a 10 ms
-// void timer1_init() {
-//     TCCR1A = 0x00;
-//     TCCR1B = (1 << WGM12) | (1 << CS11); // CTC, prescaler 8
-//     OCR1A = 20000; // (F_CPU / (prescaler * 100 Hz)) = (16MHz / (8*100)) = 20000
-//     TIMSK1 = (1 << OCIE1A);
-// }
-
-// // Interrupción por cambio de pin en D8 (PCINT0)
-// void pcint_init() {
-//     PCICR |= (1 << PCIE0);  // Grupo PCINT0 (pines 8–13)
-//     PCMSK0 |= (1 << PCINT0); // Habilitar PCINT0 (D8)
-// }
-
-// // SETUP
-// void setup() {
-
-//     // Pines de salida
-//     DDRD |= (1 << DDD4) | (1 << DDD5) | (1 << DDD6);
-
-//     // Pin del botón
-//     DDRB &= ~(1 << DDB0); // D8 como entrada
-
-//     adc_init();
-//     timer1_init();
-//     pcint_init();
-
-//     sei(); // Habilitar interrupciones globales
-// }
-
-// // LOOP (no queda vacío)
-// void loop() {
-//     // Aquí solo mostramos actividad mínima
-//     // Por ejemplo, enviar datos por Serial (si quisieras)
-//     // o procesar flags no críticos.
-
-//     if (silencio) {
-//         PORTD &= ~(1 << PORTD6); // apagar buzzer
-//     }
-// }
-
-// // ISR ADC
-// ISR(ADC_vect) {
-
-//     uint16_t lectura = ADC;
-
-//     adc_values[current_channel] = lectura;
-
-//     // Avanzar al siguiente canal
-//     current_channel++;
-//     if (current_channel >= 3) current_channel = 0;
-
-//     ADMUX = (1 << REFS0) | current_channel; 
-// }
-
-// // ISR TIMER1
-// ISR(TIMER1_COMPA_vect) {
-
-//     uint16_t temp = adc_values[0];
-//     uint16_t luz  = adc_values[1];
-//     uint16_t nivel = adc_values[2];
-
-//     bool alerta = false;
-
-//     if (temp > 500) { // temp alta
-//         PORTD |= (1 << PORTD4); 
-//         alerta = true;
-//     } else {
-//         PORTD &= ~(1 << PORTD4);
-//     }
-
-//     if (luz < 200) { // baja luz
-//         PORTD |= (1 << PORTD5);
-//     } else {
-//         PORTD &= ~(1 << PORTD5);
-//     }
-
-//     if (nivel > 600) { // nivel alto
-//         PORTD |= (1 << PORTD4);
-//         alerta = true;
-//     }
-
-//     if (alerta && !silencio) {
-//         PORTD |= (1 << PORTD6); // buzzer
-//     } else {
-//         PORTD &= ~(1 << PORTD6);
-//     }
-// }
-
-// // ISR PCINT0 - Botón
-// ISR(PCINT0_vect) {
-//     silencio = true; // apaga alarmas inmediatamente
-// }
