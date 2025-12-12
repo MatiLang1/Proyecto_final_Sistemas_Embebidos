@@ -1,4 +1,3 @@
-// Codigo completo (con interrupciones, registros I2C y valores de los 3 sensores guardados en EEPROM)
 #include <LiquidCrystal_I2C.h> 
 #include <EEPROM.h>
 
@@ -22,6 +21,7 @@ volatile uint8_t current_channel = 0; //Lleva la cuenta de qué sensor se está 
 volatile bool alarma_activa = false;
 volatile bool silencio = false;
 
+// La rutina es el codigo de una funcion q se ejecuta cuando sucede una interrupcion
 
 // FUNCIONES A NIVEL DE REGISTROS
 
@@ -171,15 +171,23 @@ void loop() {
 }
 
 
-// Rutina = lo q se ejecuta cuando se da una interrupcion
-// La rutina es el codigo de una funcion q se ejecuta cuando sucede una interrupcion, en este caso ISR(ADC_vect) es la funcion q se ejecuta cuando se da la interrupcion del ADC
 
-//ISR(ADC_vect) - Muestreo Rotativo: esta rutina se ejecuta automaticamente al finalizar la interrupcion del ADC (la que toma valores y hace la conversion ADC)
+
+
+//ISR(ADC_vect) - Muestreo Rotativo: esta rutina se ejecuta automaticamente al ocurrir la interrupcion del ADC (la que toma valores y hace la conversion ADC)
 // ISR(ADC_vect) hace la Rotación del Canal para tomar los valores de los 3 sensores uno a la vez (usando un canal analogico para cada sensor)
 // Esta rutina permite que los 3 sensores se actualicen constantemente de fondo/en segundo plano mediante interrupciones ISR sin q el loop haga nada, asi el loop() principal esta libre para manejar otras tareas sin preocuparse por los tiempos de espera de las lecturas de los sensores
+
+//La interrupción salta cada vez que se termina de leer UN solo sensor. La configuracion es:
+// Frecuencia del Arduino: 16 MHz con Prescaler = 128, entonces la velocidad del ADC es de 125 kHz (16 Mhz / 128). Una conversion toma 13 ciclos de ese tiempo, entonces tiempo de conversion = 13 * 125 Khz = 104 uS
+// Por lo tanto la funcion ISR(ADC_vect) se ejecuta cada 104 uS (aprox. 9600 veces por segundo)
+// La interrupción salta después de leer UN SOLO sensor. Funciona así:
+// Termina conversion sensor 0 -> INTERRUPCIÓN -> Guardas valor 0 -> Cambias multiplexor al 1, pasan 104 µs
+// Termina conversión sensor 1 -> INTERRUPCIÓN -> Guardas valor 1 -> Cambias multiplexor al 2, pasan 104 µs
+// Termina conversión sensor 2 -> INTERRUPCIÓN -> Guardas valor 2 -> Cambias multiplexor al 0, pasan 104 µs
 ISR(ADC_vect) {
 
-    // "Lectura": lee el valor del registro ADC y lo guarda en el array "adc_values"
+    // "Lectura": leemos el valor del registro ADC y lo guarda en el array "adc_values"
     uint16_t lectura = ADC;
     adc_values[current_channel] = lectura;
     
@@ -191,17 +199,23 @@ ISR(ADC_vect) {
     // Reconfiguración: escribe en ADMUX el nuevo canal (como el ADC está en modo Free-Running, la siguiente conversion que inicie automaticamente, usará este nuevo canal)
 }
 
-// ISR TIMER1 (Lógica de Alarma y Guardado Periódico)
+
+
+// ISR TIMER1_COMPA_vect (Logica de la alarma y guardado periodico de los valores de los sensores)
+// ISR(TIMER1_COMPA_vect) se ejecuta cada 10 ms (segun lo establecido en la configuración de la funcion void timer1_init() donde se seteo el OCR1A = 20000 y cuando se da la interrupcion ejecuta esta subrutina)
 ISR(TIMER1_COMPA_vect) {
-    static uint8_t counter_1s = 0;
+    static uint8_t contador_1s = 0;
     
-    // Logica de Alarma
+    // Logica de la alarma
     uint16_t temp = adc_values[0];
     uint16_t luz  = adc_values[1];
     uint16_t nivel = adc_values[2];
     bool alerta = false;
 
     // Logica de alarmas y control de LEDs/Buzzer con registros. Esta lógica establece 'alerta'
+    if (temp > TEMP_MAX) alerta = true;
+    if (luz < LUZ_MIN) alerta = true;
+    if (nivel > NIVEL_MAX) alerta = true;
 
     alarma_activa = alerta; 
     // Buzzer control (manteniendo el uso de registros):
@@ -211,28 +225,35 @@ ISR(TIMER1_COMPA_vect) {
         PORTD &= ~(1 << PORTD6);
     }
     
-    // Logica de guardado cada 1 segundo (usando EEPROM.put())
-    counter_1s++;
-    if (counter_1s >= 100) {
-        counter_1s = 0;
+    // LOGICA DE GUARDADO EN EEPROM cada 1 segundo (usando EEPROM.put())
+    // Cada 100 llamadas (10ms * 100 = 1s), guarda los datos en la EEPROM. Implementa un buffer circular para almacenar solo las ultimas 10 muestras
+    contador_1s++;
+    if (contador_1s >= 100) {
+        contador_1s = 0;
         
+        // EEPROM_START_ADDR: La dirección de inicio del area de almacenamiento
+        // eeprom_address_index (0 a 9): indica qué registro de los 10 queres guardar
+        // BYTES_PER_SAMPLE (6): indica el tamaño fijo de cada registro guardado (3 sensores * 2 bytes)
         uint16_t base_addr = EEPROM_START_ADDR + (eeprom_address_index * BYTES_PER_SAMPLE);
         
-        // Estructura temporal para guardar
-        struct Sample {
+        // Creamos una struct temporal para guardar los datos de la muestra y creamos el objeto datos_actuales de tipo Muestra (una instancia de Muestra)
+        struct Muestra {
             uint16_t t;
             uint16_t l;
             uint16_t n;
-        } current_data;
+        } datos_actuales;
         
-        current_data.t = adc_values[0];
-        current_data.l = adc_values[1];
-        current_data.n = adc_values[2];
+        // Asignamos los valores de los sensores a los campos del objeto "datos_actuales"
+        datos_actuales.t = adc_values[0];
+        datos_actuales.l = adc_values[1];
+        datos_actuales.n = adc_values[2];
         
-        // Guardado de las muestras con el meotodo put de la librería EEPROM
-        EEPROM.put(base_addr, current_data);
+        // Guardamos las muestras con el metodo put de la libreria EEPROM (tanto al hacer get como put en la EEPROM debemos pasarle la direccion inicial en bytes y el objeto a guardar como argumentos)
+        EEPROM.put(base_addr, datos_actuales);
+        // put serializa (convierte el objeto "datos_actuales" en una secuencia de bytes para almacenarlo en la EEPROM). Get deserializa (convierte la secuencia de bytes q se leen de la EEPROM en un objeto)
 
-        // Mover al siguiente índice circularmente
+
+        // Movemos al siguiente indice circularmente para guardar la siguiente muestra (MAX_SAMPLES = 10 muestras)
         eeprom_address_index++;
         if (eeprom_address_index >= MAX_SAMPLES) {
             eeprom_address_index = 0;
@@ -240,21 +261,27 @@ ISR(TIMER1_COMPA_vect) {
     }
 }
 
-// ISR PCINT0 - Boton (D8)
+
+
+// ISR PCINT0 - Boton (D8): cuando apretamos el boton, cambia el estado de silencio y el modo LCD pasa de 0 a 1 donde muestra los valores historicos de las muestras (cada vez q apretamos el boton nos movemos hasta el registro 10 y cuando llega a ese, al apretar el boton otra vez se cambia el modo LCD a 0 y se vuelve al modo Tiempo Real mostrando los valores actuales de los sensores)
+// La lectura inicial en el modo historico comienza mostrando la ultima muestra guardada (la de hace 1 segundo. Esto es porque inicializamos "history_index" para apuntar un lugar antes de donde se guardara la siguiente muestra
 ISR(PCINT0_vect) {
     // 1 - Poner en silencio
     silencio = true; 
 
     // 2 - Cambiar Modo LCD y navegar en el Historico de muestras
     if (lcd_mode == 0) {
-        lcd_mode = 1; // Cambia a modo Historico de muestras
+        lcd_mode = 1; // Cambia a modo Historico de muestras (LCD en modo 1)
+
         // Inicializa para mostrar el ultimo dato guardado
         history_index = (eeprom_address_index == 0) ? MAX_SAMPLES - 1 : eeprom_address_index - 1; 
     } else {
-        // En modo histórico, avanza al registro anterior (navegación)
+        // history_index arranca en 10, retrocedo de a 1 un índice para movernos por los registros de la EEPROM
         if (history_index == 0) {
-            history_index = MAX_SAMPLES - 1;
+            // Si history_index llega a 0 se llegó al último registro guardado por lo que al presionar el boton cambiamos el modo de LCD a 0 para volver a visualizar los valores de los sensores en tiempo real
+            lcd_mode = 0; 
         } else {
+            // Sino seguimos navegando por los registros de la EEPROM
             history_index--;
         }
     }
