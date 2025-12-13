@@ -4,8 +4,18 @@
 // Definiciones de la LCD I2C
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 
-// GESTIÓN DE EEPROM Y MODOS DE VISUALIZACIÓN
-// Cada dato uint16_t ocupa 2 bytes. 3 sensores * 2 bytes por sensor = 6 bytes por muestra
+// Definimos los valores umbrales para los sensores analogicos
+#define TEMP_ADVERTENCIA 600
+#define TEMP_ALERTA 800
+
+#define LUZ_ADVERTENCIA 500
+#define LUZ_ALERTA 700 
+
+#define NIVEL_ADVERTENCIA 500
+#define NIVEL_ALERTA 700
+
+// Definimos los valor
+// ISR TIMER1_COMPA_vect (Logica de la alarma y guardado periodico de los valores de los sensores) * 2 bytes por sensor = 6 bytes por muestra
 const uint8_t MAX_SAMPLES = 10;
 const uint8_t BYTES_PER_SAMPLE = 6; 
 const uint16_t EEPROM_START_ADDR = 0; 
@@ -201,28 +211,74 @@ ISR(ADC_vect) {
 
 
 
+
 // ISR TIMER1_COMPA_vect (Logica de la alarma y guardado periodico de los valores de los sensores)
 // ISR(TIMER1_COMPA_vect) se ejecuta cada 10 ms (segun lo establecido en la configuración de la funcion void timer1_init() donde se seteo el OCR1A = 20000 y cuando se da la interrupcion ejecuta esta subrutina)
 ISR(TIMER1_COMPA_vect) {
     static uint8_t contador_1s = 0;
+    static uint8_t blink_counter = 0; // Para el parpadeo
     
     // Logica de la alarma
     uint16_t temp = adc_values[0];
     uint16_t luz  = adc_values[1];
     uint16_t nivel = adc_values[2];
-    bool alerta = false;
+    
+    // 0: Normal, 1: Advertencia, 2: Alerta
+    uint8_t estado = 0; 
 
-    // Logica de alarmas y control de LEDs/Buzzer con registros. Esta lógica establece 'alerta'
-    if (temp > TEMP_MAX) alerta = true;
-    if (luz < LUZ_MIN) alerta = true;
-    if (nivel > NIVEL_MAX) alerta = true;
+    // Chequeo de condiciones (Prioridad: Alerta > Advertencia > Normal)
+    
+    // 1. Chequeo de Advertencias
+    if (temp > TEMP_ADVERTENCIA) estado = 1;
+    if (luz > LUZ_ADVERTENCIA) estado = 1;      // Luz alta es el problema
+    if (nivel > NIVEL_ADVERTENCIA) estado = 1;
 
-    alarma_activa = alerta; 
-    // Buzzer control (manteniendo el uso de registros):
-    if (alerta && !silencio) {
-        PORTD |= (1 << PORTD6); 
-    } else {
-        PORTD &= ~(1 << PORTD6);
+    // 2. Chequeo de Alertas (Sobrescribe advertencia)
+    if (temp > TEMP_ALERTA) estado = 2;
+    if (luz > LUZ_ALERTA) estado = 2;
+    if (nivel > NIVEL_ALERTA) estado = 2;
+
+    alarma_activa = (estado == 2); 
+    
+    // Control de LEDs y Buzzer
+    // D4 (Bit 4 puerto D) = OK / Normal
+    // D5 (Bit 5 puerto D) = Advertencia / Alerta
+    // D6 (Bit 6 puerto D) = Buzzer
+
+    blink_counter++;
+    if (blink_counter >= 50) blink_counter = 0; // Ciclo de parpadeo ~500ms (50 * 10ms)
+
+    switch (estado) {
+        case 0: // NORMAL
+            PORTD |= (1 << PORTD4);  // D4 ON (Amarillo)
+            PORTD &= ~(1 << PORTD5); // D5 OFF (Rojo)
+            PORTD &= ~(1 << PORTD6); // Buzzer OFF
+            break;
+            
+        case 1: // ADVERTENCIA
+            PORTD |= (1 << PORTD4);  // D4 ON (Sigue todo "funcionando")
+            
+            // D5 Parpadea
+            if (blink_counter < 25) {
+                PORTD |= (1 << PORTD5);
+            } else {
+                PORTD &= ~(1 << PORTD5);
+            }
+            
+            PORTD &= ~(1 << PORTD6); // Buzzer OFF
+            break;
+            
+        case 2: // ALERTA
+            PORTD &= ~(1 << PORTD4); // LED Amarillo se apaga (valores superaron umbral de alerta)
+            PORTD |= (1 << PORTD5);  // Se prende el LED Rojo
+
+            // Buzzer ON (si no esta en modo silencio)
+            if (!silencio) {
+                PORTD |= (1 << PORTD6); 
+            } else {
+                PORTD &= ~(1 << PORTD6);
+            }
+            break;
     }
     
     // LOGICA DE GUARDADO EN EEPROM cada 1 segundo (usando EEPROM.put())
@@ -252,7 +308,7 @@ ISR(TIMER1_COMPA_vect) {
         EEPROM.put(base_addr, datos_actuales);
         // put serializa (convierte el objeto "datos_actuales" en una secuencia de bytes para almacenarlo en la EEPROM). Get deserializa (convierte la secuencia de bytes q se leen de la EEPROM en un objeto)
 
-
+        
         // Movemos al siguiente indice circularmente para guardar la siguiente muestra (MAX_SAMPLES = 10 muestras)
         eeprom_address_index++;
         if (eeprom_address_index >= MAX_SAMPLES) {
