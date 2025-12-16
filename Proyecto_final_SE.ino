@@ -1,39 +1,63 @@
 #include <LiquidCrystal_I2C.h> 
 #include <EEPROM.h>
+#include <DHT.h>
 
 // Definiciones de la LCD I2C
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 
-// Definimos los valores umbrales para los sensores analogicos
-#define TEMP_ADVERTENCIA 600
-#define TEMP_ALERTA 800
+// Configuración del sensor DHT
+#define PIN_DHT 7     // Pin digital para el DHT11
+#define TIPO_DHT DHT11
+DHT dht(PIN_DHT, TIPO_DHT);
 
-#define LUZ_ADVERTENCIA 500
-#define LUZ_ALERTA 700 
+// Definimos los valores umbrales para los sensores
+#define TEMP_ADVERTENCIA 28 // Grados °C
+#define TEMP_ALERTA 38     // Grados °C
 
-#define NIVEL_ADVERTENCIA 500
-#define NIVEL_ALERTA 700
+#define LUZ_ADVERTENCIA 600
+#define LUZ_ALERTA 800 
 
-// Definimos los valor
-// ISR TIMER1_COMPA_vect (Logica de la alarma y guardado periodico de los valores de los sensores) * 2 bytes por sensor = 6 bytes por muestra
-const uint8_t MAX_SAMPLES = 10;
-const uint8_t BYTES_PER_SAMPLE = 6; 
-const uint16_t EEPROM_START_ADDR = 0; 
+#define NIVEL_ADVERTENCIA 120
+#define NIVEL_ALERTA 200
 
-//LCD = 0 indica datos en Tiempo Real, LCD = 1 indica acceso a las muestras anteriores almacenada en EEPROM
-volatile uint8_t lcd_mode = 0; 
-volatile uint8_t history_index = 0; // Índice de la muestra histórica a mostrar (0-9)
-volatile uint8_t eeprom_address_index = 0; // Índice de la última muestra guardada (0-9)
+// Bloqueo Atómico (cli/sei): El tiempo que se "pausan" las interrupciones en el loop para guardar la temperatura es de microsegundos (solo copiar 2 bytes), así que no afecta en absoluto al funcionamiento del resto del sistema
 
-// Variables de interrupciones
-volatile uint16_t adc_values[3] = {0,0,0}; //Es un array para guardar las lecturas de los 3 sensores, es volatile porque se llena dentro de una interrupción y se lee en el loop
-volatile uint8_t current_channel = 0; //Lleva la cuenta de qué sensor se está leyendo (0, 1 o 2)
+
+// Constantes para almacenamiento y lógica
+const uint8_t MAX_MUESTRAS = 10;
+const uint8_t BYTES_POR_MUESTRA = 6; 
+const uint16_t EEPROM_DIRECCION_INICIO = 0; 
+const uint16_t TIEMPO_BUZZER_MAX = 1500; // 15 segundos * 100 ticks/seg (10ms cada tick)
+const uint8_t TIEMPO_DEBOUNCE = 20;      // 200 ms * 100 ticks/seg (Anti-rebote)
+
+// LCD = 0: Tiempo Real, LCD = 1: Histórico
+volatile uint8_t modo_lcd = 0; 
+volatile uint8_t indice_historial = 0; // Índice para navegar el histórico (0-9)
+volatile uint8_t indice_eeprom = 0;    // Índice de la última muestra guardada (0-9)
+
+// Variables de sensores
+// valores_adc[0] = Temperatura (DHT), [1] = Luz (ADC1), [2] = Nivel (ADC2)
+volatile uint16_t valores_sensores[3] = {0, 0, 0}; 
+volatile uint8_t canal_actual_adc = 1; // Arrancamos en 1 porque 0 es temperatura digital
+
+// Estructura de datos para las muestras (Global)
+struct Muestra {
+    uint16_t t;
+    uint16_t l;
+    uint16_t n;
+};
+
+// Variables de estado y control
 volatile bool alarma_activa = false;
-volatile bool silencio = false;
+volatile uint8_t estado_sistema = 0;  // 0: OK, 1: Advertencia, 2: Alerta (Global para uso en LCD)
+volatile bool buzzer_encendido = false;
+volatile uint16_t contador_tiempo_buzzer = 0; // Cuenta hasta 15s
+volatile uint8_t contador_debounce = 0;       // Para evitar rebotes del botón
+volatile bool guardar_eeprom = false;         // Bandera para guardar en EEPROM desde el loop
 
-// La rutina es el codigo de una funcion q se ejecuta cuando sucede una interrupcion
-
-// FUNCIONES A NIVEL DE REGISTROS
+// Temporizador para leer DHT en el loop (no bloqueante)
+unsigned long ultimo_tiempo_dht = 0;
+const long INTERVALO_DHT = 2000; // Leer cada 2 segundos
 
 // Configurar ADC en modo Free-Running con interrupciones
 void adc_init() {
@@ -49,6 +73,11 @@ void adc_init() {
     ADCSRB = 0x00; // Selecciona el modo "Free Running". En cuanto termina una conversión, inicia la siguiente inmediatamente. Tan pronto como el ADC termina de convertir la lectura de un pin analógico (ej el A0) y el resultado se guarda en el registro de datos, el ADC se dispara automáticamente (inicia) la siguiente conversión sin necesidad de una nueva instrucción de software o un evento externo
     //Free Running se refiere a la configuración del Modo de Disparo (Trigger Mode) del ADC en el Arduino. ADCSRB = 0x00; hace lo siguiente: Modo Seleccionado: "Free Running" (Funcionamiento Libre)
     // Al escribir 0x00  en el registro ADCSRB (ADC Control and Status Register B), se configuran los bits ADTS2:0 (ADC Auto Trigger Source) a 000. Este valor 000 corresponde al modo Free Running.
+
+    // Configurar primer canal analógico a leer: Canal 1 (Luz)
+    // El canal 0 ya no se usa via ADC porque es digital (DHT)
+    canal_actual_adc = 1; 
+    ADMUX = (ADMUX & 0xF8) | canal_actual_adc;
 
     ADCSRA |= (1 << ADSC); // Inicia la primer conversión (dsp el modo Free Running dispara automaticamente las otras conversiones, pero la primera conversion debe inciarse manualmente). Es el boton de arranque para comenzar el ciclo continuo de conversiones
      // Esta instrucción tiene dos partes:
@@ -69,6 +98,8 @@ void adc_init() {
     // OCR1A = 20000: Con el reloj a 2MHz, contar 20000 pulsos toma 10ms (20.000/2.000.000 = 0.01s)
 // Interrupción:
     // TIMSK1 = (1 << OCIE1A): Habilita la interrupción cuando el timer llega a 20.000 pulsos para ello Ejecuta ISR(TIMER1_COMPA_vect)
+
+
 void timer1_init() {
     TCCR1A = 0x00;
     TCCR1B = (1 << WGM12) | (1 << CS11); // Activa el modo CTC (Clear Timer on Compare Match). El timer cuenta desde 0 hasta el valor de OCR1A. Cuando llega (es pq matcheo el valor del timer 1 "TCNT1" con el valor de OCR1A), el contador del timer vuelve a 0 automáticamente
@@ -76,6 +107,8 @@ void timer1_init() {
     TIMSK1 = (1 << OCIE1A); // Habilita la interrupción, cuando el contador llega a 20000 ejecuta la ISR(TIMER1_COMPA_vect)
 
 }
+
+
 
 // Interrupción externa realizada por Boton/Pulsador - por cambio de estado en el pin D8 (PCINT0)
 // Esta funcion se usa para detectar el botón en el pin digital 8 (Puerto B, bit 0)
@@ -86,20 +119,31 @@ void pcint_init() {
     PCMSK0 |= (1 << PCINT0); // Dentro de ese grupo, habilita específicamente el pin D8. Si el estado del pin 8 cambia (0 a 1 o 1 a 0), se dispara la interrupción
 }
 
-// SETUP (definimos pines de entrada/salida, inicializamos perifericos y habilitamos interrupciones globales)
 
+
+// SETUP (definimos pines de entrada/salida, inicializamos perifericos y habilitamos interrupciones globales)
 void setup() {
-    // Inicialización LCD I2C (Alto Nivel)
+    // Inicializamos LCD
     lcd.init();
     lcd.backlight();
-    lcd.print("Monitoreo Amb.");
+    lcd.print("Iniciando...");
+    delay(1000);
+    lcd.clear();
 
-    // PINES DE SALIDA
-    // (Data Direction Register) configura si un pin es entrada (0) o salida (1). Aca ponemos los bits 4, 5 y 6 del Puerto D como Salidas (para LEDs y Buzzer)
+    // Inicializar sensor DHT
+    dht.begin();
+
+    // Configuración de PINES
+    // D4, D5, D6 como SALIDAS (LEDs y Buzzer)
     DDRD |= (1 << DDD4) | (1 << DDD5) | (1 << DDD6);
 
     // PINES DE ENTRADA
     DDRB &= ~(1 << DDB0); // Pone el bit 0 del Puerto B (Pin 8) como Entrada (el del Boton/Pulsador)
+
+    // Activar RESISTENCIAS PULL-UP internas para sensores analógicos
+    // A1 (Luz) es el que falla dando valores bajos (4-9), el pull-up le dará referencia de VCC
+    // A1 = PC1 (Pin analógico 1), A2 = PC2 (Pin analógico 2)
+    PORTC |= (1 << PORTC1) | (1 << PORTC2);
 
     adc_init();
     timer1_init();
@@ -109,71 +153,127 @@ void setup() {
 }
 
 
-// LOOP (Muestra los valores en la pantalla LCD)
+// LOOP (Mostramos los valores en la pantalla LCD)
 void loop() {
-    
-    // Muestra la actividad mínima (apagar el buzzer si silencio es true)
-    if (silencio) {
-        PORTD &= ~(1 << PORTD6);
+    static uint8_t ultimo_modo = 255; // Para detectar cambio de modo y limpiar pantalla
+
+    // Detectar cambio de modo para limpiar pantalla
+    if (modo_lcd != ultimo_modo) {
+        lcd.clear();
+        ultimo_modo = modo_lcd;
+        // Pequeño delay para asegurar que el clear se procese visualmente antes de escribir
+        delay(10); 
     }
 
-    if (lcd_mode == 0) {
-        // LCD en Modo 0: Valores de sensores en tiempo real
-        uint16_t temp = adc_values[0];
-        uint16_t luz  = adc_values[1];
-        uint16_t nivel = adc_values[2];
+    // Gestion de EEPROM
+    if (guardar_eeprom) {
+        guardar_eeprom = false; // Bajamos la bandera
+
+        // Calculamos dirección usando la constante correcta EEPROM_DIRECCION_INICIO
+        uint16_t addr_base = EEPROM_DIRECCION_INICIO + (indice_eeprom * BYTES_POR_MUESTRA);
+        
+        Muestra datos_actuales;
+        
+        // Copia atómica de los valores volátiles
+        uint8_t sreg_old = SREG;
+        cli(); 
+        datos_actuales.t = valores_sensores[0];
+        datos_actuales.l = valores_sensores[1]; // LUZ en A1 (índice 1)
+        datos_actuales.n = valores_sensores[2]; // NIVEL en A2 (índice 2)
+
+        SREG = sreg_old;
+        
+        EEPROM.put(addr_base, datos_actuales);
+        
+        // Avanzar índice circular
+        indice_eeprom++;
+        if (indice_eeprom >= MAX_MUESTRAS) {
+            indice_eeprom = 0;
+        }
+    }
+
+    // Lectura del DHT11 (Digital, lento, fuera de ISR)
+    unsigned long tiempo_actual = millis();
+    if (tiempo_actual - ultimo_tiempo_dht >= INTERVALO_DHT) {
+        ultimo_tiempo_dht = tiempo_actual;
+        
+        // Leemos temperatura
+        float t = dht.readTemperature();
+        
+        // Si la lectura es válida, actualizamos variable global
+        // Guardamos en valores_sensores[0] casteado a int para compatibilidad
+        if (!isnan(t)) {
+            // Deshabilitamos interrupciones momentáneamente para escritura atómica de variable compartida de 16bits
+            uint8_t sreg_old = SREG;
+            cli();
+            valores_sensores[0] = (uint16_t)t;
+            SREG = sreg_old;
+        }
+    }
+
+    // Actualizamos Pantalla LCD
+    if (modo_lcd == 0) {
+        // MODO 0: TIEMPO REAL
+        uint16_t temp, luz, nivel; //Declaramos variables locales para almacenar los valores leidos
+        
+        //Lectura atomica de las variables volatiles
+        uint8_t sreg_old = SREG;
+        cli();
+        temp = valores_sensores[0];
+        luz  = valores_sensores[1]; // LUZ en A1 (índice 1)
+        nivel = valores_sensores[2]; // NIVEL en A2 (índice 2)
+        SREG = sreg_old;
         
         lcd.setCursor(0, 0); 
-        lcd.print("T: ");
+        lcd.print("T:");
         lcd.print(temp);
-        lcd.print("   L: ");
+        lcd.print("  L:");
         lcd.print(luz);
+        lcd.print("   "); // Limpiar residuos
         
         lcd.setCursor(0, 1);
-        lcd.print("N: ");
+        lcd.print("N:");
         lcd.print(nivel);
         lcd.print(" ");
         
-        if (silencio) {
-            lcd.print("SILENCIO");
-        } else if (alarma_activa) {
-            lcd.print("ALERTA! ");
+        if (estado_sistema == 2) {
+            lcd.print("ALERTA!!!");
+        } else if (estado_sistema == 1) {
+            lcd.print("Warning");
         } else {
             lcd.print("OK      "); 
         }
+
     } else {
         // LCD en Modo 1: Historico de muestras (Leemos los valores de la EEPROM con EEPROM.get())
         
 
         // Calculamos la dirección base de la EEPROM (para determinar la dirección de memoria exacta en la EEPROM donde se deben guardar/leer los datos)
         // Permite el acceso secuencial a registros de datos que tienen un tamaño fijo dentro de la EEPROM. El valor de base_addr es la dirección de la primera celda de memoria de la EEPROM donde se almacena el conjunto de datos correspondiente a ese índice histórico
-        uint16_t base_addr = EEPROM_START_ADDR + (history_index * BYTES_PER_SAMPLE);
+        uint16_t addr_base = EEPROM_DIRECCION_INICIO + (indice_historial * BYTES_POR_MUESTRA);
 
 
 
-        // Estructura para leer 6 bytes juntos (la muestra entera con los valores de los 3 sensores)
-        // Creamos la estructura "Muestra" con los campos t (temperatura), l (luz) y n (nivel), luego creamos la variable "h_data" de tipo "Muestra"
-        struct Muestra {
-            uint16_t t;
-            uint16_t l;
-            uint16_t n;
-        } h_data;
+        // Usamos la estructura global Muestra
+        Muestra datos_historicos;
 
 
-        // Usando el metodo GET, Leemos la muestra completa de 6 bytes (t, l, y n) de la EEPROM a partir de la direccion "base_addr" y la cargamos en el objeto "h_data" (h_data es una instancia de la struct "Muestra")
-        EEPROM.get(base_addr, h_data);
-        
+        // Usando el metodo GET, Leemos la muestra completa de 6 bytes (t, l, y n) de la EEPROM a partir de la direccion "addr_base" y la cargamos en el objeto "datos_historicos" (datos_historicos es una instancia de la struct "Muestra")
+        EEPROM.get(addr_base, datos_historicos);
+
         lcd.setCursor(0, 0);
-        lcd.print("REG: ");
-        lcd.print(history_index + 1); // Muestras 1-10 (sumamos 1 pq el indice arranca en 0)
-        lcd.print("/10 T: ");
-        lcd.print(h_data.t); // Muestra la temperatura (el campo t de la estructura h_data)
+        lcd.print("R:");              // 2 chars
+        lcd.print(indice_historial + 1); // 1-2 chars
+        lcd.print(" T:");             // 3 chars
+        lcd.print(datos_historicos.t); // 2-3 chars
+        lcd.print("C");               // 1 char -> Total ~10-11 chars (Entra en 16)
         
         lcd.setCursor(0, 1);
-        lcd.print("L: ");
-        lcd.print(h_data.l); // Muestra la luz (el campo l de la estructura h_data)
-        lcd.print(" N: ");
-        lcd.print(h_data.n); // Muestra el nivel (el campo n de la estructura h_data)
+        lcd.print("L:");              // 2 chars
+        lcd.print(datos_historicos.l); // 1-4 chars
+        lcd.print(" N:");             // 3 chars
+        lcd.print(datos_historicos.n); // 1-4 chars
+        // Total max: 2+4+3+4 = 13 chars (Entra en 16)
     }
     
     // Retardo para no saturar la comunicación I2C (POSIBLEMENTE CAMBIAR A FUNCION MILLIS)
@@ -182,7 +282,7 @@ void loop() {
 
 
 
-
+//INTERRUPCIONES
 
 //ISR(ADC_vect) - Muestreo Rotativo: esta rutina se ejecuta automaticamente al ocurrir la interrupcion del ADC (la que toma valores y hace la conversion ADC)
 // ISR(ADC_vect) hace la Rotación del Canal para tomar los valores de los 3 sensores uno a la vez (usando un canal analogico para cada sensor)
@@ -195,125 +295,125 @@ void loop() {
 // Termina conversion sensor 0 -> INTERRUPCIÓN -> Guardas valor 0 -> Cambias multiplexor al 1, pasan 104 µs
 // Termina conversión sensor 1 -> INTERRUPCIÓN -> Guardas valor 1 -> Cambias multiplexor al 2, pasan 104 µs
 // Termina conversión sensor 2 -> INTERRUPCIÓN -> Guardas valor 2 -> Cambias multiplexor al 0, pasan 104 µs
+// ISR ADC: Muestreo de sensores analogicos (SOLO LUZ y NIVEL)
 ISR(ADC_vect) {
 
     // "Lectura": leemos el valor del registro ADC y lo guarda en el array "adc_values"
     uint16_t lectura = ADC;
-    adc_values[current_channel] = lectura;
+    valores_sensores[canal_actual_adc] = lectura;
     
-    // Avanzar al siguiente canal
-    current_channel++;
-    if (current_channel >= 3) current_channel = 0;
+    // Alternar solo entre Canal 1 (Luz) y Canal 2 (Nivel)
+    // Si estaba en 1 pasa a 2, si estaba en 2 pasa a 1.
+    if (canal_actual_adc == 1) {
+        canal_actual_adc = 2;
+    } else {
+        canal_actual_adc = 1;
+    }
     
-    ADMUX = (1 << REFS0) | current_channel;
-    // Reconfiguración: escribe en ADMUX el nuevo canal (como el ADC está en modo Free-Running, la siguiente conversion que inicie automaticamente, usará este nuevo canal)
+    // Configurar multiplexor para la PRÓXIMA conversión
+    ADMUX = (ADMUX & 0xF8) | canal_actual_adc;
 }
 
-
-
-
-// ISR TIMER1_COMPA_vect (Logica de la alarma y guardado periodico de los valores de los sensores)
-// ISR(TIMER1_COMPA_vect) se ejecuta cada 10 ms (segun lo establecido en la configuración de la funcion void timer1_init() donde se seteo el OCR1A = 20000 y cuando se da la interrupcion ejecuta esta subrutina)
+//ISR TIMER1: Logica de Alarma, Buzzer Temporizado y Debounce
 ISR(TIMER1_COMPA_vect) {
     static uint8_t contador_1s = 0;
-    static uint8_t blink_counter = 0; // Para el parpadeo
+    static uint8_t contador_parpadeo = 0;
     
-    // Logica de la alarma
-    uint16_t temp = adc_values[0];
-    uint16_t luz  = adc_values[1];
-    uint16_t nivel = adc_values[2];
+    // Decrementar contador de debounce si está activo
+    if (contador_debounce > 0) {
+        contador_debounce--;
+    }
+
+    uint16_t temp = valores_sensores[0];
+    uint16_t luz  = valores_sensores[1]; // LUZ en A1
+    uint16_t nivel = valores_sensores[2]; // NIVEL en A2
     
     // 0: Normal, 1: Advertencia, 2: Alerta
     uint8_t estado = 0; 
 
     // Chequeo de condiciones (Prioridad: Alerta > Advertencia > Normal)
     
-    // 1. Chequeo de Advertencias
+    // Chequeo de Advertencias
     if (temp > TEMP_ADVERTENCIA) estado = 1;
-    if (luz > LUZ_ADVERTENCIA) estado = 1;      // Luz alta es el problema
+    if (luz > LUZ_ADVERTENCIA) estado = 1;    // Luz alta es el problema (> 600)
     if (nivel > NIVEL_ADVERTENCIA) estado = 1;
 
-    // 2. Chequeo de Alertas (Sobrescribe advertencia)
+    // Chequeo de Alertas (sobrescribe advertencia)
     if (temp > TEMP_ALERTA) estado = 2;
-    if (luz > LUZ_ALERTA) estado = 2;
+    if (luz > LUZ_ALERTA) estado = 2;         // Luz muy alta es alerta (> 800)
     if (nivel > NIVEL_ALERTA) estado = 2;
 
+    estado_sistema = estado; // Actualizamos variable global para el LCD
     alarma_activa = (estado == 2); 
     
-    // Control de LEDs y Buzzer
-    // D4 (Bit 4 puerto D) = OK / Normal
-    // D5 (Bit 5 puerto D) = Advertencia / Alerta
-    // D6 (Bit 6 puerto D) = Buzzer
+    // LÓGICA DE BUZZER CON LATCH (Memoria de 15 segundos)
+    // Si se dispara la alarma (estado 2) y no estaba contando, inicia la cuenta.
+    if (estado == 2 && contador_tiempo_buzzer == 0) {
+        contador_tiempo_buzzer = 1; 
+    }
+    
+    // Si la cuenta está en progreso (1 a 1500), mantén el buzzer prendido
+    if (contador_tiempo_buzzer > 0 && contador_tiempo_buzzer <= 1500) {
+        buzzer_encendido = true;
+        contador_tiempo_buzzer++;
+        
+        // Al terminar los 15s (1500 ticks), bloqueamos el buzzer
+        if (contador_tiempo_buzzer > 1500) {
+            contador_tiempo_buzzer = 1501; // Estado "Apagado"
+        }
+    } else {
+        // Estado 0 (Reposo) o 1501 (Apagado) -> Buzzer Apagado
+        buzzer_encendido = false;
+        
+        // Reset del Latch: Solo si la alarma SE FUE (estado != 2) y ya habíamos terminado (1501)
+        // permitimos volver a 0 para que una futura alarma vuelva a sonar.
+        if (estado != 2 && contador_tiempo_buzzer == 1501) {
+            contador_tiempo_buzzer = 0;
+        }
+    }
+    
+    // Control de Hardware (LEDs y Buzzer)
+    // D4 (OK), D5 (Alerta), D6 (Buzzer)
+    
+    contador_parpadeo++;
+    if (contador_parpadeo >= 50) contador_parpadeo = 0; 
 
-    blink_counter++;
-    if (blink_counter >= 50) blink_counter = 0; // Ciclo de parpadeo ~500ms (50 * 10ms)
+    // Apagar todo por defecto para setear segun estado
+    // Buzzer se controla por la variable 'buzzer_encendido' derivada del latch
+    if (buzzer_encendido) {
+        PORTD |= (1 << PORTD6);
+    } else {
+        PORTD &= ~(1 << PORTD6);
+    }
 
     switch (estado) {
         case 0: // NORMAL
-            PORTD |= (1 << PORTD4);  // D4 ON (Amarillo)
-            PORTD &= ~(1 << PORTD5); // D5 OFF (Rojo)
-            PORTD &= ~(1 << PORTD6); // Buzzer OFF
+            PORTD |= (1 << PORTD4);  // Amarillo ON
+            PORTD &= ~(1 << PORTD5); // Rojo OFF
             break;
             
         case 1: // ADVERTENCIA
-            PORTD |= (1 << PORTD4);  // D4 ON (Sigue todo "funcionando")
-            
-            // D5 Parpadea
-            if (blink_counter < 25) {
+            PORTD |= (1 << PORTD4);  // Amarillo ON
+            // Rojo Parpadea
+            if (contador_parpadeo < 25) {
                 PORTD |= (1 << PORTD5);
             } else {
                 PORTD &= ~(1 << PORTD5);
             }
-            
-            PORTD &= ~(1 << PORTD6); // Buzzer OFF
             break;
             
         case 2: // ALERTA
-            PORTD &= ~(1 << PORTD4); // LED Amarillo se apaga (valores superaron umbral de alerta)
-            PORTD |= (1 << PORTD5);  // Se prende el LED Rojo
-
-            // Buzzer ON (si no esta en modo silencio)
-            if (!silencio) {
-                PORTD |= (1 << PORTD6); 
-            } else {
-                PORTD &= ~(1 << PORTD6);
-            }
+            PORTD &= ~(1 << PORTD4); // Amarillo OFF
+            PORTD |= (1 << PORTD5);  // Rojo ON
             break;
     }
     
     // LOGICA DE GUARDADO EN EEPROM cada 1 segundo (usando EEPROM.put())
-    // Cada 100 llamadas (10ms * 100 = 1s), guarda los datos en la EEPROM. Implementa un buffer circular para almacenar solo las ultimas 10 muestras
+    // Cada 400 llamadas (10ms * 400 = 4s), guarda los datos en la EEPROM. Implementa un buffer circular para almacenar solo las ultimas 10 muestras. Solo levantamos la bandera, el guardado pesado se hace en el loop
     contador_1s++;
-    if (contador_1s >= 100) {
+    if (contador_1s >= 400) {
         contador_1s = 0;
-        
-        // EEPROM_START_ADDR: La dirección de inicio del area de almacenamiento
-        // eeprom_address_index (0 a 9): indica qué registro de los 10 queres guardar
-        // BYTES_PER_SAMPLE (6): indica el tamaño fijo de cada registro guardado (3 sensores * 2 bytes)
-        uint16_t base_addr = EEPROM_START_ADDR + (eeprom_address_index * BYTES_PER_SAMPLE);
-        
-        // Creamos una struct temporal para guardar los datos de la muestra y creamos el objeto datos_actuales de tipo Muestra (una instancia de Muestra)
-        struct Muestra {
-            uint16_t t;
-            uint16_t l;
-            uint16_t n;
-        } datos_actuales;
-        
-        // Asignamos los valores de los sensores a los campos del objeto "datos_actuales"
-        datos_actuales.t = adc_values[0];
-        datos_actuales.l = adc_values[1];
-        datos_actuales.n = adc_values[2];
-        
-        // Guardamos las muestras con el metodo put de la libreria EEPROM (tanto al hacer get como put en la EEPROM debemos pasarle la direccion inicial en bytes y el objeto a guardar como argumentos)
-        EEPROM.put(base_addr, datos_actuales);
-        // put serializa (convierte el objeto "datos_actuales" en una secuencia de bytes para almacenarlo en la EEPROM). Get deserializa (convierte la secuencia de bytes q se leen de la EEPROM en un objeto)
-
-        
-        // Movemos al siguiente indice circularmente para guardar la siguiente muestra (MAX_SAMPLES = 10 muestras)
-        eeprom_address_index++;
-        if (eeprom_address_index >= MAX_SAMPLES) {
-            eeprom_address_index = 0;
-        }
+        guardar_eeprom = true;
     }
 }
 
@@ -322,23 +422,35 @@ ISR(TIMER1_COMPA_vect) {
 // ISR PCINT0 - Boton (D8): cuando apretamos el boton, cambia el estado de silencio y el modo LCD pasa de 0 a 1 donde muestra los valores historicos de las muestras (cada vez q apretamos el boton nos movemos hasta el registro 10 y cuando llega a ese, al apretar el boton otra vez se cambia el modo LCD a 0 y se vuelve al modo Tiempo Real mostrando los valores actuales de los sensores)
 // La lectura inicial en el modo historico comienza mostrando la ultima muestra guardada (la de hace 1 segundo. Esto es porque inicializamos "history_index" para apuntar un lugar antes de donde se guardara la siguiente muestra
 ISR(PCINT0_vect) {
-    // 1 - Poner en silencio
-    silencio = true; 
-
-    // 2 - Cambiar Modo LCD y navegar en el Historico de muestras
-    if (lcd_mode == 0) {
-        lcd_mode = 1; // Cambia a modo Historico de muestras (LCD en modo 1)
-
-        // Inicializa para mostrar el ultimo dato guardado
-        history_index = (eeprom_address_index == 0) ? MAX_SAMPLES - 1 : eeprom_address_index - 1; 
-    } else {
-        // history_index arranca en 10, retrocedo de a 1 un índice para movernos por los registros de la EEPROM
-        if (history_index == 0) {
-            // Si history_index llega a 0 se llegó al último registro guardado por lo que al presionar el boton cambiamos el modo de LCD a 0 para volver a visualizar los valores de los sensores en tiempo real
-            lcd_mode = 0; 
+    // Verificar si el debounce permite una nueva pulsación
+    if (contador_debounce == 0) {
+        // Chequear si el pin está realmente en el estado activo (Asumiendo activo ALTO por defecto o cambio de estado)
+        // Como es interrupción por cambio (Change), entra al soltar y al apretar.
+        // Si el usuario tiene pull-down (boton a VCC): leer 1 es presionado
+        // Si el usuario tiene pull-up (boton a GND): leer 0 es presionado
+        // Vamos a asumir que detectamos el cambio y actuamos, pero bloqueamos por un tiempo.
+        // Simplemente actuamos ante el evento y bloqueamos.
+        
+        // Seteamos tiempo de bloqueo (200ms aprox)
+        contador_debounce = TIEMPO_DEBOUNCE;
+        
+        // Lógica de navegación del LCD
+        if (modo_lcd == 0) {
+            modo_lcd = 1; // Ir a histórico
+            // Mostrar última muestra grabada
+            if (indice_eeprom == 0) {
+                indice_historial = MAX_MUESTRAS - 1;
+            } else {
+                indice_historial = indice_eeprom - 1;
+            }
         } else {
-            // Sino seguimos navegando por los registros de la EEPROM
-            history_index--;
+            // Estamos en histórico, retrocedemos
+            if (indice_historial == 0) {
+                // Si llegamos al final (o principio), volvemos a tiempo real
+                modo_lcd = 0; 
+            } else {
+                indice_historial--;
+            }
         }
     }
 }
