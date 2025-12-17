@@ -15,7 +15,7 @@ DHT dht(PIN_DHT, TIPO_DHT);
 #define TEMP_ALERTA 38     // Grados °C
 
 #define LUZ_ADVERTENCIA 600
-#define LUZ_ALERTA 800 
+#define LUZ_ALERTA 800
 
 #define NIVEL_ADVERTENCIA 120
 #define NIVEL_ALERTA 200
@@ -27,18 +27,10 @@ DHT dht(PIN_DHT, TIPO_DHT);
 const uint8_t MAX_MUESTRAS = 10;
 const uint8_t BYTES_POR_MUESTRA = 6; 
 const uint16_t EEPROM_DIRECCION_INICIO = 0; 
+const uint16_t DIR_INDICE_PERSISTENTE = 100; // Dirección para guardar el índice
 const uint16_t TIEMPO_BUZZER_MAX = 1500; // 15 segundos * 100 ticks/seg (10ms cada tick)
 const uint8_t TIEMPO_DEBOUNCE = 20;      // 200 ms * 100 ticks/seg (Anti-rebote)
 
-// LCD = 0: Tiempo Real, LCD = 1: Histórico
-volatile uint8_t modo_lcd = 0; 
-volatile uint8_t indice_historial = 0; // Índice para navegar el histórico (0-9)
-volatile uint8_t indice_eeprom = 0;    // Índice de la última muestra guardada (0-9)
-
-// Variables de sensores
-// valores_adc[0] = Temperatura (DHT), [1] = Luz (ADC1), [2] = Nivel (ADC2)
-volatile uint16_t valores_sensores[3] = {0, 0, 0}; 
-volatile uint8_t canal_actual_adc = 1; // Arrancamos en 1 porque 0 es temperatura digital
 
 // Estructura de datos para las muestras (Global)
 struct Muestra {
@@ -46,6 +38,22 @@ struct Muestra {
     uint16_t l;
     uint16_t n;
 };
+
+// LCD = 0: Tiempo Real, LCD = 1: Histórico
+volatile uint8_t modo_lcd = 0; 
+volatile uint8_t indice_historial = 0; // Índice para navegar el histórico (0-9)
+volatile uint8_t indice_eeprom = 0;    // Índice de la última muestra guardada (0-9)
+volatile uint8_t indice_snapshot = 0;  // Captura del índice para congelar la vista del historial en la pantalla LCD
+
+// Buffer en RAM para visualización estática del historial
+Muestra historial_ram[MAX_MUESTRAS];
+
+// Variables de sensores
+// valores_adc[0] = Temperatura (DHT), [1] = Luz (ADC1), [2] = Nivel (ADC2)
+volatile uint16_t valores_sensores[3] = {0, 0, 0}; 
+volatile uint8_t canal_actual_adc = 1; // Arrancamos en 1 porque 0 es temperatura digital
+
+
 
 // Variables de estado y control
 volatile bool alarma_activa = false;
@@ -141,9 +149,15 @@ void setup() {
     DDRB &= ~(1 << DDB0); // Pone el bit 0 del Puerto B (Pin 8) como Entrada (el del Boton/Pulsador)
 
     // Activar RESISTENCIAS PULL-UP internas para sensores analógicos
-    // A1 (Luz) es el que falla dando valores bajos (4-9), el pull-up le dará referencia de VCC
     // A1 = PC1 (Pin analógico 1), A2 = PC2 (Pin analógico 2)
     PORTC |= (1 << PORTC1) | (1 << PORTC2);
+    
+    // Recuperar índice de EEPROM para mantener continuidad en el historial
+    indice_eeprom = EEPROM.read(DIR_INDICE_PERSISTENTE);
+    // Validación por si es la primera vez (0xFF) o basura
+    if (indice_eeprom >= MAX_MUESTRAS) {
+        indice_eeprom = 0;
+    }
 
     adc_init();
     timer1_init();
@@ -157,10 +171,27 @@ void setup() {
 void loop() {
     static uint8_t ultimo_modo = 255; // Para detectar cambio de modo y limpiar pantalla
 
-    // Detectar cambio de modo para limpiar pantalla
+    // Detectar cambio de modo para limpiar pantalla y CARGAR SNAPSHOT
     if (modo_lcd != ultimo_modo) {
         lcd.clear();
         ultimo_modo = modo_lcd;
+        
+        // Si entramos al modo Historial (1), cargamos la RAM desde la EEPROM
+        if (modo_lcd == 1) {
+            // Recorremos los 10 registros y los ordenamos en RAM
+            // historial_ram[0] será el mpas reciente, historial_ram[9] el más antiguo
+            uint8_t ptr_escritura = indice_eeprom; // Donde se escribirá el próximo (o se estaba por escribir)
+            
+            for (int i = 0; i < MAX_MUESTRAS; i++) {
+                // Formula circular inversa: (Puntero - 1 - i)
+                int16_t index_calc = ptr_escritura - 1 - i;
+                if (index_calc < 0) index_calc += MAX_MUESTRAS;
+                
+                uint16_t addr = EEPROM_DIRECCION_INICIO + (index_calc * BYTES_POR_MUESTRA);
+                EEPROM.get(addr, historial_ram[i]);
+            }
+        }
+
         // Pequeño delay para asegurar que el clear se procese visualmente antes de escribir
         delay(10); 
     }
@@ -175,21 +206,32 @@ void loop() {
         Muestra datos_actuales;
         
         // Copia atómica de los valores volátiles
+        // Y escritura protegida para evitar corrupción por interrupciones
         uint8_t sreg_old = SREG;
-        cli(); 
-        datos_actuales.t = valores_sensores[0];
-        datos_actuales.l = valores_sensores[1]; // LUZ en A1 (índice 1)
-        datos_actuales.n = valores_sensores[2]; // NIVEL en A2 (índice 2)
-
-        SREG = sreg_old;
+        cli();  
         
+        datos_actuales.t = valores_sensores[0];
+        datos_actuales.l = valores_sensores[1]; // A1 (Luz) Directo
+        datos_actuales.n = valores_sensores[2]; // A2 (Nivel) Directo
+
         EEPROM.put(addr_base, datos_actuales);
+        
+        SREG = sreg_old; // Reactivar interrupciones (sei implícito si estaban activas)
+        
+        // Guardamos el NUEVO índice para la próxima vez
+        // Nota: indice_eeprom apunta al lugar donde escribiremos LA PROXIMA.
+        // Lo guardamos ANTES de incrementar? No, guardamos el que acabamos de usar?
+        // Queremos saber dónde escribir al reiniciar.
+        // Entoces: Escribimos en X. Incrementamos a X+1. Guardamos X+1.
         
         // Avanzar índice circular
         indice_eeprom++;
         if (indice_eeprom >= MAX_MUESTRAS) {
             indice_eeprom = 0;
         }
+        
+        // Persistir el índice del puntero de escritura
+        EEPROM.write(DIR_INDICE_PERSISTENTE, indice_eeprom);
     }
 
     // Lectura del DHT11 (Digital, lento, fuera de ISR)
@@ -220,8 +262,8 @@ void loop() {
         uint8_t sreg_old = SREG;
         cli();
         temp = valores_sensores[0];
-        luz  = valores_sensores[1]; // LUZ en A1 (índice 1)
-        nivel = valores_sensores[2]; // NIVEL en A2 (índice 2)
+        luz  = valores_sensores[1]; // A1 (Luz)
+        nivel = valores_sensores[2]; // A2 (Nivel)
         SREG = sreg_old;
         
         lcd.setCursor(0, 0); 
@@ -245,25 +287,15 @@ void loop() {
         }
 
     } else {
-        // LCD en Modo 1: Historico de muestras (Leemos los valores de la EEPROM con EEPROM.get())
+        // LCD en Modo 1: Historico de muestras
+        // Leemos directamente del buffer RAM que cargamos al entrar al modo.
+        // Esto garantiza ESTABILIDAD (Snapshot) y RAPIDEZ.
         
-
-        // Calculamos la dirección base de la EEPROM (para determinar la dirección de memoria exacta en la EEPROM donde se deben guardar/leer los datos)
-        // Permite el acceso secuencial a registros de datos que tienen un tamaño fijo dentro de la EEPROM. El valor de base_addr es la dirección de la primera celda de memoria de la EEPROM donde se almacena el conjunto de datos correspondiente a ese índice histórico
-        uint16_t addr_base = EEPROM_DIRECCION_INICIO + (indice_historial * BYTES_POR_MUESTRA);
-
-
-
-        // Usamos la estructura global Muestra
-        Muestra datos_historicos;
-
-
-        // Usando el metodo GET, Leemos la muestra completa de 6 bytes (t, l, y n) de la EEPROM a partir de la direccion "addr_base" y la cargamos en el objeto "datos_historicos" (datos_historicos es una instancia de la struct "Muestra")
-        EEPROM.get(addr_base, datos_historicos);
+        Muestra datos_historicos = historial_ram[indice_historial];
 
         lcd.setCursor(0, 0);
-        lcd.print("R:");              // 2 chars
-        lcd.print(indice_historial + 1); // 1-2 chars
+        lcd.print("R:-");             // R:-X indica "X muestras atrás"
+        lcd.print(indice_historial);  // 0 a 9
         lcd.print(" T:");             // 3 chars
         lcd.print(datos_historicos.t); // 2-3 chars
         lcd.print("C");               // 1 char -> Total ~10-11 chars (Entra en 16)
@@ -273,7 +305,6 @@ void loop() {
         lcd.print(datos_historicos.l); // 1-4 chars
         lcd.print(" N:");             // 3 chars
         lcd.print(datos_historicos.n); // 1-4 chars
-        // Total max: 2+4+3+4 = 13 chars (Entra en 16)
     }
     
     // Retardo para no saturar la comunicación I2C (POSIBLEMENTE CAMBIAR A FUNCION MILLIS)
@@ -297,17 +328,16 @@ void loop() {
 // Termina conversión sensor 2 -> INTERRUPCIÓN -> Guardas valor 2 -> Cambias multiplexor al 0, pasan 104 µs
 // ISR ADC: Muestreo de sensores analogicos (SOLO LUZ y NIVEL)
 ISR(ADC_vect) {
-
-    // "Lectura": leemos el valor del registro ADC y lo guarda en el array "adc_values"
     uint16_t lectura = ADC;
+    
+    // Asignación DIRECTA: Lo que leo del canal X va al índice X
     valores_sensores[canal_actual_adc] = lectura;
     
     // Alternar solo entre Canal 1 (Luz) y Canal 2 (Nivel)
-    // Si estaba en 1 pasa a 2, si estaba en 2 pasa a 1.
     if (canal_actual_adc == 1) {
-        canal_actual_adc = 2;
+        canal_actual_adc = 2; // Siguiente: Canal 2
     } else {
-        canal_actual_adc = 1;
+        canal_actual_adc = 1; // Siguiente: Canal 1
     }
     
     // Configurar multiplexor para la PRÓXIMA conversión
@@ -316,7 +346,7 @@ ISR(ADC_vect) {
 
 //ISR TIMER1: Logica de Alarma, Buzzer Temporizado y Debounce
 ISR(TIMER1_COMPA_vect) {
-    static uint8_t contador_1s = 0;
+    static uint16_t contador_1s = 0; // uint16_t para contar hasta 400 ms
     static uint8_t contador_parpadeo = 0;
     
     // Decrementar contador de debounce si está activo
@@ -325,8 +355,8 @@ ISR(TIMER1_COMPA_vect) {
     }
 
     uint16_t temp = valores_sensores[0];
-    uint16_t luz  = valores_sensores[1]; // LUZ en A1
-    uint16_t nivel = valores_sensores[2]; // NIVEL en A2
+    uint16_t luz  = valores_sensores[1]; // A1 (Luz)
+    uint16_t nivel = valores_sensores[2]; // A2 (Nivel)
     
     // 0: Normal, 1: Advertencia, 2: Alerta
     uint8_t estado = 0; 
@@ -408,10 +438,10 @@ ISR(TIMER1_COMPA_vect) {
             break;
     }
     
-    // LOGICA DE GUARDADO EN EEPROM cada 1 segundo (usando EEPROM.put())
-    // Cada 400 llamadas (10ms * 400 = 4s), guarda los datos en la EEPROM. Implementa un buffer circular para almacenar solo las ultimas 10 muestras. Solo levantamos la bandera, el guardado pesado se hace en el loop
+    // LOGICA DE GUARDADO EN EEPROM cada 30 segundos
+    // Cada 3000 llamadas (10ms * 3000 = 30s)
     contador_1s++;
-    if (contador_1s >= 400) {
+    if (contador_1s >= 3000) {
         contador_1s = 0;
         guardar_eeprom = true;
     }
@@ -437,19 +467,15 @@ ISR(PCINT0_vect) {
         // Lógica de navegación del LCD
         if (modo_lcd == 0) {
             modo_lcd = 1; // Ir a histórico
-            // Mostrar última muestra grabada
-            if (indice_eeprom == 0) {
-                indice_historial = MAX_MUESTRAS - 1;
-            } else {
-                indice_historial = indice_eeprom - 1;
-            }
+            indice_snapshot = indice_eeprom; // CONGELAR el estado actual para la visualización
+            indice_historial = 0; // Mostrar la más reciente (0 pasos atrás)
         } else {
-            // Estamos en histórico, retrocedemos
-            if (indice_historial == 0) {
-                // Si llegamos al final (o principio), volvemos a tiempo real
+            // Estamos en histórico, retrocedemos una muestra
+            indice_historial++;
+            
+            // Si pasamos las 10 muestras (0 a 9), volvemos a tiempo real
+            if (indice_historial >= MAX_MUESTRAS) {
                 modo_lcd = 0; 
-            } else {
-                indice_historial--;
             }
         }
     }
