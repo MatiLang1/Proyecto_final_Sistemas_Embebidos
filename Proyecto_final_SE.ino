@@ -359,7 +359,7 @@ ISR(ADC_vect) {
     ADMUX = (ADMUX & 0xF8) | canal_actual_adc;
 }
 
-//ISR TIMER1: Logica de Alarma, Buzzer Temporizado y Debounce
+//ISR TIMER1: Logica de Alarma, Buzzer Temporizado y el antirebote del boton
 ISR(TIMER1_COMPA_vect) {
     static uint16_t contador_3s = 0; //para contar hasta 3000 ms
     static uint8_t contador_parpadeo = 0;
@@ -469,7 +469,7 @@ ISR(PCINT0_vect) {
     // Verificar si el antirebote permite una nueva pulsacion del boton
     if (contador_debounce == 0) {
         
-        // Seteamos tiempo de bloqueo (200ms)
+        // Ponemos tiempo de bloqueo para antirebote 200 ms (los 20 de TIEMPO_DEBOUNCE q van bajando de a 1 por cada vez que se ejecuta ISR(TIMER1), la cual se ejecuta cada 10ms)
         contador_debounce = TIEMPO_DEBOUNCE;
         
         // Logica de navegacion de la LCD
