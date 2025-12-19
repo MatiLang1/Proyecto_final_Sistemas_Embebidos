@@ -1,130 +1,154 @@
-#include <LiquidCrystal_I2C.h> 
-#include <EEPROM.h>
-#include <DHT.h>
+// Importamos librerias, Definimos constantes y variables globales, Creamos las interrupciones con trabajo de registros, hacemos el setup, hacemos el loop, hacemos las subrutinas q se ejecutan tras las interrupciones
+
+#include <LiquidCrystal_I2C.h> // Libreria para la LCD I2C
+#include <EEPROM.h> // Libreria para la EEPROM
+#include <DHT.h> // Libreria para el sensor de Temperatura DHT11
 
 // Definiciones de la LCD I2C
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 
-// Configuración del sensor DHT
-#define PIN_DHT 7     // Pin digital para el DHT11
-#define TIPO_DHT DHT11
-DHT dht(PIN_DHT, TIPO_DHT);
+// Configuramos el sensor de Temperatura
+#define PIN_DHT 7     // Pin digital 7 para el DHT11
+#define TIPO_DHT DHT11 // Le indicamos a la libreria DHT que tipo de sensor es (en este caso DHT11)
+DHT dht(PIN_DHT, TIPO_DHT); // DHT es la clase, dht es una instancia de la clase DHT, a dicho objeto le pasamos el pin y el tipo de sensor (asi le indicamos al objeto en q pin trabajar y q tipo de sensor es). Esto nos permi q cuando quiera leer temperatura, solo llamamos a dht.readTemperature() el cual es uno de los metodos que tiene la clase DHT
 
 // Definimos los valores umbrales para los sensores
 #define TEMP_ADVERTENCIA 28 // Grados °C
 #define TEMP_ALERTA 38     // Grados °C
-
 #define LUZ_ADVERTENCIA 600
 #define LUZ_ALERTA 800
-
 #define NIVEL_ADVERTENCIA 120
 #define NIVEL_ALERTA 200
 
-// Bloqueo Atómico (cli/sei): El tiempo que se "pausan" las interrupciones en el loop para guardar la temperatura es de microsegundos (solo copiar 2 bytes), así que no afecta en absoluto al funcionamiento del resto del sistema
+// Para poder guardar valores en la EEPROM sin ser interrumpido por las interrupciones, realizamos un Bloqueo Atómico (cli/sei) . El tiempo que se pausan las interrupciones en el loop para guardar la temperatura es de microsegundos (solo copiar 2 bytes), por lo q no afecta en absoluto al funcionamiento del sistema
 
 
 // Constantes para almacenamiento y lógica
-const uint8_t MAX_MUESTRAS = 10;
-const uint8_t BYTES_POR_MUESTRA = 6; 
-const uint16_t EEPROM_DIRECCION_INICIO = 0; 
-const uint16_t DIR_INDICE_PERSISTENTE = 100; // Dirección para guardar el índice
-const uint16_t TIEMPO_BUZZER_MAX = 1500; // 15 segundos * 100 ticks/seg (10ms cada tick)
-const uint8_t TIEMPO_DEBOUNCE = 20;      // 200 ms * 100 ticks/seg (Anti-rebote)
+const uint8_t MAX_MUESTRAS = 10; // Muestras que se guardan en la EEPROM
+const uint8_t BYTES_POR_MUESTRA = 6; // Cantidad de bytes por muestra (2 para la Temperatura, 2 para la Luz y 2 para el Nivel)
+const uint16_t EEPROM_DIRECCION_INICIO = 0; // Dirección inicial de la EEPROM
+const uint16_t DIR_INDICE_PERSISTENTE = 100; // Dirección para guardar el índice. Lo usamos para recordar en que posición (0 al 9) nos quedamos escribiendo antes de apagarse el Arduino (si no guardáramos este número, al reiniciar el Arduino empezaría siempre desde el 0)
+
+const uint16_t TIEMPO_BUZZER_MAX = 1500; // El Timer1 hace 100 ticks por segundo (10ms cada tick) por ello, para q el buzzer dure 15 S, se usa 1500 ticks. El N 1500 indica cuántas veces tiene que despertarse el timer antes de apagar el buzzer
+
+const uint8_t TIEMPO_DEBOUNCE = 20; // 20 ticks por 10 ms = 200 ms q esperamos para liberar al boton (antirebote)
 
 
-// Estructura de datos para las muestras (Global)
+// Creamos una Estructura de datos para las muestras (Global)
 struct Muestra {
     uint16_t t;
     uint16_t l;
     uint16_t n;
 };
 
-// LCD = 0: Tiempo Real, LCD = 1: Histórico
-volatile uint8_t modo_lcd = 0; 
-volatile uint8_t indice_historial = 0; // Índice para navegar el histórico (0-9)
-volatile uint8_t indice_eeprom = 0;    // Índice de la última muestra guardada (0-9)
-volatile uint8_t indice_snapshot = 0;  // Captura del índice para congelar la vista del historial en la pantalla LCD
 
-// Buffer en RAM para visualización estática del historial
-Muestra historial_ram[MAX_MUESTRAS];
+// Variables globales (son volatiles pq pueden ser afectadas por interrupciones asiq no deben ser cacheadas en el registro sino que siempre deben ser leidas de la RAM)
+volatile uint8_t modo_lcd = 0; // Para controlar el modo de la LCD (LCD = 0 muestras en Tiempo Real, LCD = 1 Historial de muestras)
+volatile uint8_t indice_historial = 0; // Indice para navegar el histórico (0-9), lo controlamos con el boton
 
-// Variables de sensores
-// valores_adc[0] = Temperatura (DHT), [1] = Luz (ADC1), [2] = Nivel (ADC2)
+volatile uint8_t indice_eeprom = 0;    // Indice q apunta a la posición (0-9) donde se va a guardar el siguiente dato nuevo. Avanza automaticamente cada 30 segundos
+
+volatile uint8_t indice_snapshot = 0;  // Es una copia de "indice_eeprom" que se toma en el instante en que entras al "Historico de muestras". Sirve para congelar la referencia (aunque el sistema siga escribiendo nuevos datos y moviendo indice_eeprom, nosotros vamos a ver en la LCD los datos guardados en la EEPROM hasta el momento en q presionamos el boton para acceder al "Historico de muestras")
+
+// Buffer en RAM para visualizacion estatica del historial. Reservamos espacio en la RAMpara guardar 10 copias exactas de los datos (MAX_MUESTRAS). Cuando apretas el botón de historial, el Arduino va a la EEPROM, copia todo en RAM y muestra esta copia. Asi logramos el efecto "Snapshot" (miramos esta copia quieta en RAM mientras el Arduino sigue escribiendo en la EEPROM real)
+Muestra historial_ram[MAX_MUESTRAS]; // "historial_ram" es un array de estructuras (de "Muestra"), su tamaño es de MAX_MUESTRAS (q es 10)
+
+
+// VARIABLES DE SENSORES
+// valores_adc[0] = Temperatura (DHT), valores_adc[1] = Luz (ADC1), valores_adc[2] = Nivel (ADC2)
 volatile uint16_t valores_sensores[3] = {0, 0, 0}; 
 volatile uint8_t canal_actual_adc = 1; // Arrancamos en 1 porque 0 es temperatura digital
 
 
+// VARIABLES DE ESTADO Y CONTROL
+volatile bool alarma_activa = false; // Flag para controlar el estado de la alarma (arranca apagada)
+volatile uint8_t estado_sistema = 0; // 0 = OK, 1 = Advertencia, 2 = Alerta
+volatile bool buzzer_encendido = false; // Flag para controlar el estado del buzzer (arranca apagado)
+volatile uint16_t contador_tiempo_buzzer = 0; // Cuenta hasta 15s y apaga el buzzer
+volatile uint8_t contador_debounce = 0; // Para evitar rebotes del botón (cuenta 200 ms, acepta clics del boton cada minimo 200 ms)
+volatile bool guardar_eeprom = false; // Flag para guardar en EEPROM desde el loop (la interrupcion de ADC activa esta flag y cuando eso pasa, el loop guarda en la EEPROM)
 
-// Variables de estado y control
-volatile bool alarma_activa = false;
-volatile uint8_t estado_sistema = 0;  // 0: OK, 1: Advertencia, 2: Alerta (Global para uso en LCD)
-volatile bool buzzer_encendido = false;
-volatile uint16_t contador_tiempo_buzzer = 0; // Cuenta hasta 15s
-volatile uint8_t contador_debounce = 0;       // Para evitar rebotes del botón
-volatile bool guardar_eeprom = false;         // Bandera para guardar en EEPROM desde el loop
 
-// Temporizador para leer DHT en el loop (no bloqueante)
+// TEMPORIZADOR PARA LEER DHT EN EL LOOP, es NO BLOQUEANTE osea q no bloquea el loop sino q sigue ejecutando lineas hasta q pasen los 2 segundos, para ello usamos millis()
+// Cada vez q pasa por la linea del loop, verifica si pasaron 2s (sino pasaron, sigue ejecutando cosas, por ello las interrupciones son + rapidas ya que recien ejecuta la linea de codigo cuando vuelve a pasar por ella y ya pasaron > 2s)
 unsigned long ultimo_tiempo_dht = 0;
-const long INTERVALO_DHT = 2000; // Leer cada 2 segundos
+const long INTERVALO_DHT = 2000; // Leemos el valor del sensor de Temp cada 2 segundos
 
-// Configurar ADC en modo Free-Running con interrupciones
+
+
+
+// INTERRUPCIONES
+
+//INTERRUPCION ADC (para tomar valores de los sensores analogicos)
+
+//Constantes de Arduino para los valores decimales: REFS0 es el numero 6 en decimal (indica la posicion 6 de los 8 bits, cuando haces el << REFS0, el bit 1 se desplaza 6 lugares a la izquierda), ADEN es el numero 7, ADATE es el numero 5, ADIE es el numero 3 (podriamos usar los valores en decimal directamente en el registro)
+// ADCSRA = (1 << ADEN) | (1 << ADATE) | (1 << ADIE); habilitamos el ADC (con ADEN), el disparo automático (con ADATE) y la interrupción (con ADIE)"
+//el | es para sumar los bits (001 + 010 = 0111)
+
+// Inicializamos/Configuramos el ADC en modo Free-Running con interrupciones
 void adc_init() {
-    ADMUX = (1 << REFS0);       // Selecciona a VCC (5V) como voltaje de referencia para q el ADC sepa que el max es 1023, inicialmente apunta al canal 0 (ADC0)
-    ADCSRA = (1 << ADEN) |      // Prende el ADC
 
-             (1 << ADATE) |     // Habilita el Auto trigger (disparo automático), significa que cuando termina una conversión, puede arrancar otra automáticamente
+    //1 es 00000001 y REFS0 es el número 6, que indica la posición del bit. Entonces (1 << REFS0 = correr el bit 1 6 lugares a la izquierda), resultado = 01000000 el cual asignamos al registro "ADMUX". Asi igual con todos
 
-             (1 << ADIE) |      // Habilita la Interrupción del ADC. Esto es clave porque cada vez que termine de medir y hacer la conversión, se ejecuta la función ISR(ADC_vect)
+    ADMUX = (1 << REFS0); //Elegimos VCC (5V) como voltaje de referencia para q el ADC sepa que el max es 1023, inicialmente apunta al canal 0 (ADC0)
+    
+    ADCSRA = (1 << ADEN) | // Prende el ADC
 
-             (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // Configura el Prescaler a 128. Configurar el prescaler a 128 en los registros del Arduino tiene un impacto en la Frecuencia de funcionamiento de componentes específicos del microcontrolador (como en el ADC o los Timers/Contadores). El prescaler es un divisor de frecuencia, toma la señal del reloj principal del Arduino (16 MHz) y la divide por un factor preestablecido (128 en este caso)
+             (1 << ADATE) | // Habilita el Auto trigger (disparo automático), significa que cuando termina una conversión, puede arrancar otra automáticamente
+
+             (1 << ADIE) | // Habilita la Interrupción del ADC. Esto es clave porque cada vez que termine de medir y hacer la conversión, se ejecuta la función ISR(ADC_vect)
+
+             (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // Configura el Prescaler a 128 (el prescaler divide la señal del reloj principal del Arduino (16 MHz) por el factor indicado, 128 aca)
              
-    ADCSRB = 0x00; // Selecciona el modo "Free Running". En cuanto termina una conversión, inicia la siguiente inmediatamente. Tan pronto como el ADC termina de convertir la lectura de un pin analógico (ej el A0) y el resultado se guarda en el registro de datos, el ADC se dispara automáticamente (inicia) la siguiente conversión sin necesidad de una nueva instrucción de software o un evento externo
-    //Free Running se refiere a la configuración del Modo de Disparo (Trigger Mode) del ADC en el Arduino. ADCSRB = 0x00; hace lo siguiente: Modo Seleccionado: "Free Running" (Funcionamiento Libre)
-    // Al escribir 0x00  en el registro ADCSRB (ADC Control and Status Register B), se configuran los bits ADTS2:0 (ADC Auto Trigger Source) a 000. Este valor 000 corresponde al modo Free Running.
+    ADCSRB = 0x00; // Selecciona el modo "Free Running". En cuanto termina una conversión, inicia la siguiente inmediatamente. Apenas el ADC termina de convertir la lectura de un pin analógico (ej el A0) en digital y el resultado se guarda en el registro de datos, el ADC se dispara automáticamente iniciando la siguiente conversión sin necesidad de una nueva instrucción o un evento externo
+    //Free Running se refiere a la configuración del Modo de Disparo/Trigger del ADC en el Arduino
+    // Al escribir 0x00  en el registro ADCSRB, se configuran los bits 000 en el registro ADTS (ADC Auto Trigger Source), este 000 corresponde al modo Free Running
 
-    // Configurar primer canal analógico a leer: Canal 1 (Luz)
-    // El canal 0 ya no se usa via ADC porque es digital (DHT)
-    canal_actual_adc = 1; 
-    ADMUX = (ADMUX & 0xF8) | canal_actual_adc;
+    
+    // Configuramos el primer canal analogico a leer - Canal 1 (Luz)
+    canal_actual_adc = 1;
+    ADMUX = (ADMUX & 0xF8) | canal_actual_adc; //borramos los bits correspondientes al canal (conserva los primeros 5) y le agregamos los 3 del canal actual
 
-    ADCSRA |= (1 << ADSC); // Inicia la primer conversión (dsp el modo Free Running dispara automaticamente las otras conversiones, pero la primera conversion debe inciarse manualmente). Es el boton de arranque para comenzar el ciclo continuo de conversiones
+    // ADSC es el Bit 6 del registro ADCSRA
+    //(REFS0 es el Bit 6 pero del registro ADMUX)
+
+    ADCSRA |= (1 << ADSC); // Inicia la primer conversión (dsp el modo Free Running dispara automaticamente las otras conversiones, pero la primera conversion tenemos q iniciarla manualmente). Es el boton de arranque para comenzar el ciclo continuo de conversiones
      // Esta instrucción tiene dos partes:
         // 1 - Registro y Bit
             // ADCSRA: Es el registro de Control y Estado A del ADC
             // ADSC: Es el bit ADC Start Conversion dentro de ese registro
-        // 2 - Acción: Iniciar la Conversión(1 << ADSC): Crea una máscara binaria donde solo el bit ADSC está en 1. |=: Es el operador OR a nivel de bits (Bitwise OR) y asignación. Lo que hace es establecer (poner en 1) el bit ADSC sin modificar el estado de ningún otro bit en el registro ADCSRA.El Efecto: Al establecer el bit ADSC a 1, le estás dando la orden al hardware del microcontrolador de Iniciar la Conversión Analógica-Digital
+        // 2 - Acción: Iniciar la Conversión(1 << ADSC): Crea una máscara binaria donde solo el bit ADSC está en 1. |= es el operador OR a nivel de bits. Lo que hace es poner en 1 el bit ADSC sin modificar el estado de ningún otro bit en el registro ADCSRA. Al establecer el bit ADSC a 1, le damos la orden al hardware del microcontrolador de Iniciar la Conversión Analogica-Digital
 }
 
 
-// La funcion timer1_init ejecuta la función ISR (para hacer la interrupcion) cada vez que el Timer 1 cuenta 20.000 pulsos de su reloj pre-escalado
-// Se usa el Timer1 (16 bits) para generar una base de tiempo exacta de 10ms (100 Hz)
+
+//INTERRUPCION TIMER1 (mide tiempo, cada 10 ms lanza la interrupcion para ejecutar logica de Alarma, Advertencia, etc)
+// La funcion timer1_init() ejecuta la subrutina establecida en la funcion ISR (dado q se dispara la interrupcion) cada vez que el Timer 1 cuenta 20.000 pulsos de su reloj preescalado
+// Usamos el Timer1 para generar una base de tiempo exacta de 10ms (100 Hz)
 // Modo CTC (Clear Timer on Compare Match):
     // TCCR1B = (1 << WGM12): El timer cuenta hasta un valor tope y se reinicia
 // Prescaler:
         // TCCR1B |= (1 << CS11): Divide el reloj principal por 8 (16MHz / 8 = 2MHz)
-// Valor de Comparación (Tope):
-    // OCR1A = 20000: Con el reloj a 2MHz, contar 20000 pulsos toma 10ms (20.000/2.000.000 = 0.01s)
+// Valor de Comparación:
+    // OCR1A = 20000: Con el reloj a 2MHz, contar 20000 pulsos toma 10ms (20.000/2.000.000 = 0,01s)
 // Interrupción:
     // TIMSK1 = (1 << OCIE1A): Habilita la interrupción cuando el timer llega a 20.000 pulsos para ello Ejecuta ISR(TIMER1_COMPA_vect)
-
-
 void timer1_init() {
     TCCR1A = 0x00;
     TCCR1B = (1 << WGM12) | (1 << CS11); // Activa el modo CTC (Clear Timer on Compare Match). El timer cuenta desde 0 hasta el valor de OCR1A. Cuando llega (es pq matcheo el valor del timer 1 "TCNT1" con el valor de OCR1A), el contador del timer vuelve a 0 automáticamente
     OCR1A = 20000; // 16MHz / (8*100) = 20000 (100 Hz -> 10 ms)
-    TIMSK1 = (1 << OCIE1A); // Habilita la interrupción, cuando el contador llega a 20000 ejecuta la ISR(TIMER1_COMPA_vect)
+    TIMSK1 = (1 << OCIE1A); // Habilita la interrupción, cuando el contador llega a 20000 se lanza la interrupcion y se ejecuta ISR(TIMER1_COMPA_vect) la cual es la subrutina que se ejecuta cada vez que se dispara esta interrupcion
 
 }
 
 
 
-// Interrupción externa realizada por Boton/Pulsador - por cambio de estado en el pin D8 (PCINT0)
+// Interrupción EXTERNA REALIZADA POR BOTON/PULSADOR - por cambio de estado en el pin D8 (PCINT0)
 // Esta funcion se usa para detectar el botón en el pin digital 8 (Puerto B, bit 0)
-    // PCICR |= (1 << PCIE0): Habilita el grupo de interrupciones 0 (que controla los pines D8 a D13)
-    // PCMSK0 |= (1 << PCINT0): Habilita específicamente la interrupción para el pin D8. Cualquier cambio de estado (LOW a HIGH o viceversa) dispara ISR(PCINT0_vect) la cual es la función que se ejecuta cuando se produce la interrupción
+// El registro PCMSK0 tiene 8 bits y controla D8 al D13, el bit 0 de ese registro, corresponde al D8
 void pcint_init() {
-    PCICR |= (1 << PCIE0);    // Habilita el Grupo 0 de interrupciones, que corresponde a los pines D8 hasta D13 (Puerto B)
-    PCMSK0 |= (1 << PCINT0); // Dentro de ese grupo, habilita específicamente el pin D8. Si el estado del pin 8 cambia (0 a 1 o 1 a 0), se dispara la interrupción
+    PCICR |= (1 << PCIE0); // Habilita el Grupo 0 de interrupciones, que corresponde a los pines D8 hasta D13 (Puerto B)
+    PCMSK0 |= (1 << PCINT0); // Dentro de ese grupo 0, habilita específicamente el pin D8. Si el estado del pin 8 cambia (0 a 1 o 1 a 0), se dispara la interrupción y se ejecuta la subrutina ISR(PCINT0_vect)
 }
 
 
@@ -138,7 +162,7 @@ void setup() {
     delay(1000);
     lcd.clear();
 
-    // Inicializar sensor DHT
+    // Inicializamos sensor de Temp
     dht.begin();
 
     // Configuración de PINES
@@ -146,24 +170,24 @@ void setup() {
     DDRD |= (1 << DDD4) | (1 << DDD5) | (1 << DDD6);
 
     // PINES DE ENTRADA
-    DDRB &= ~(1 << DDB0); // Pone el bit 0 del Puerto B (Pin 8) como Entrada (el del Boton/Pulsador)
+    DDRB &= ~(1 << DDB0); // Pone el bit 0 del Puerto B (Pin digital 8) como Entrada (el del Boton)
 
-    // Activar RESISTENCIAS PULL-UP internas para sensores analógicos
-    // A1 = PC1 (Pin analógico 1), A2 = PC2 (Pin analógico 2)
+    // Activamos las resistencias pull-up internas para sensores analógicos en los pines A1 y A2
     PORTC |= (1 << PORTC1) | (1 << PORTC2);
     
-    // Recuperar índice de EEPROM para mantener continuidad en el historial
+    // Recuperamos el indice de EEPROM para mantener continuidad en el historico de muestras
     indice_eeprom = EEPROM.read(DIR_INDICE_PERSISTENTE);
-    // Validación por si es la primera vez (0xFF) o basura
+
     if (indice_eeprom >= MAX_MUESTRAS) {
         indice_eeprom = 0;
     }
 
+    // Inicializamos las interrupciones
     adc_init();
     timer1_init();
     pcint_init();
 
-    sei(); // Habilitar interrupciones globales
+    sei(); // Habilitamos interrupciones (Hasta que no ejecutamos sei(), las interrupciones estan "muteadas" aunque esten configuradas. Al ejecutar sei(), damos permiso al CPU para que atienda a las interrupciones)
 }
 
 
@@ -176,23 +200,23 @@ void loop() {
         lcd.clear();
         ultimo_modo = modo_lcd;
         
-        // Si entramos al modo Historial (1), cargamos la RAM desde la EEPROM
+        // Si entramos al modo Historial, cargamos los valores desde la EEPROM a la RAM
         if (modo_lcd == 1) {
-            // Recorremos los 10 registros y los ordenamos en RAM
-            // historial_ram[0] será el mpas reciente, historial_ram[9] el más antiguo
-            uint8_t ptr_escritura = indice_eeprom; // Donde se escribirá el próximo (o se estaba por escribir)
+            // historial_ram[0] contiene la muestra mas reciente
+            uint8_t ptr_escritura = indice_eeprom; // Donde se escribira la siguiente muestra
             
             for (int i = 0; i < MAX_MUESTRAS; i++) {
                 // Formula circular inversa: (Puntero - 1 - i)
                 int16_t index_calc = ptr_escritura - 1 - i;
-                if (index_calc < 0) index_calc += MAX_MUESTRAS;
+                if (index_calc < 0) index_calc += MAX_MUESTRAS; //para q el indice vuelva a 10
                 
-                uint16_t addr = EEPROM_DIRECCION_INICIO + (index_calc * BYTES_POR_MUESTRA);
-                EEPROM.get(addr, historial_ram[i]);
+                uint16_t addr = EEPROM_DIRECCION_INICIO + (index_calc * BYTES_POR_MUESTRA); // Calculamos la direccion de la muestra
+                EEPROM.get(addr, historial_ram[i]); // Leemos la muestra de la EEPROM y la guardamos en la RAM
+                    //GET va la direccion "addr" y lo q obtiene de ahi lo mete en "historial_ram[i]", q es un vector de la estructura "Muestra" por lo q almacena la muestra en la struct i
             }
         }
 
-        // Pequeño delay para asegurar que el clear se procese visualmente antes de escribir
+        // Delay para asegurar que el clear se procese visualmente antes de escribir en la LCD
         delay(10); 
     }
 
@@ -200,15 +224,14 @@ void loop() {
     if (guardar_eeprom) {
         guardar_eeprom = false; // Bajamos la bandera
 
-        // Calculamos dirección usando la constante correcta EEPROM_DIRECCION_INICIO
+        // Calculamos dirección usando la constante EEPROM_DIRECCION_INICIO
         uint16_t addr_base = EEPROM_DIRECCION_INICIO + (indice_eeprom * BYTES_POR_MUESTRA);
         
-        Muestra datos_actuales;
+        Muestra datos_actuales; //creamos el objeto "datos_actuales" del tipo struct "Muestra"
         
-        // Copia atómica de los valores volátiles
-        // Y escritura protegida para evitar corrupción por interrupciones
-        uint8_t sreg_old = SREG;
-        cli();  
+        // Copia atómica de los valores volatiles y escritura protegida para evitar corrupcion de valores por interrupciones
+        uint8_t sreg_old = SREG; // guardamos una copia del estado actual del sistema (incluyendo si las interrupciones estaban prendidas o apagadas). SREG es una buena practica
+        cli(); //bloqueamos las interrupciones (nada interrumpe al CPU), para que la copia de los datos que dura varios ciclos sea Atomica (indivisible)
         
         datos_actuales.t = valores_sensores[0];
         datos_actuales.l = valores_sensores[1]; // A1 (Luz) Directo
@@ -216,40 +239,33 @@ void loop() {
 
         EEPROM.put(addr_base, datos_actuales);
         
-        SREG = sreg_old; // Reactivar interrupciones (sei implícito si estaban activas)
+        SREG = sreg_old; // Reactivar interrupciones
         
-        // Guardamos el NUEVO índice para la próxima vez
-        // Nota: indice_eeprom apunta al lugar donde escribiremos LA PROXIMA.
-        // Lo guardamos ANTES de incrementar? No, guardamos el que acabamos de usar?
-        // Queremos saber dónde escribir al reiniciar.
-        // Entoces: Escribimos en X. Incrementamos a X+1. Guardamos X+1.
-        
-        // Avanzar índice circular
+
         indice_eeprom++;
         if (indice_eeprom >= MAX_MUESTRAS) {
             indice_eeprom = 0;
         }
         
-        // Persistir el índice del puntero de escritura
+        // Persistimos el nuevo indice del puntero de escritura (asi el Arduino arranca de ahi)
         EEPROM.write(DIR_INDICE_PERSISTENTE, indice_eeprom);
     }
 
-    // Lectura del DHT11 (Digital, lento, fuera de ISR)
+    // Lectura del sensor de Temp
     unsigned long tiempo_actual = millis();
     if (tiempo_actual - ultimo_tiempo_dht >= INTERVALO_DHT) {
         ultimo_tiempo_dht = tiempo_actual;
         
-        // Leemos temperatura
+        // Leemos temperatura (usamos float para verificar q no sea NAN)
         float t = dht.readTemperature();
         
-        // Si la lectura es válida, actualizamos variable global
-        // Guardamos en valores_sensores[0] casteado a int para compatibilidad
+        // Si t no es NAN (puede dar NAN si el sensor no esta funcionando), guardamos el valor de "t" en valores_sensores[0] conviertiendolo a uint16_t primero (ya que valores_sensores es un array de tipo uint16_t)
         if (!isnan(t)) {
             // Deshabilitamos interrupciones momentáneamente para escritura atómica de variable compartida de 16bits
-            uint8_t sreg_old = SREG;
-            cli();
+            uint8_t sreg_old = SREG; // Otra vez usamos SREG para guardar el estado de las interrupciones (guardamos q estaban habilitadas)
+            cli(); //bloqueamos interrupciones
             valores_sensores[0] = (uint16_t)t;
-            SREG = sreg_old;
+            SREG = sreg_old; // volvemos al estado anterior (reactivamos interrupciones)
         }
     }
 
@@ -259,19 +275,19 @@ void loop() {
         uint16_t temp, luz, nivel; //Declaramos variables locales para almacenar los valores leidos
         
         //Lectura atomica de las variables volatiles
-        uint8_t sreg_old = SREG;
-        cli();
+        uint8_t sreg_old = SREG; // guardamos estado de interrupciones
+        cli(); //bloqueamos interrupciones
         temp = valores_sensores[0];
         luz  = valores_sensores[1]; // A1 (Luz)
         nivel = valores_sensores[2]; // A2 (Nivel)
-        SREG = sreg_old;
+        SREG = sreg_old; // volvemos al estado anterior (reactivamos interrupciones)
         
         lcd.setCursor(0, 0); 
         lcd.print("T:");
         lcd.print(temp);
         lcd.print("  L:");
         lcd.print(luz);
-        lcd.print("   "); // Limpiar residuos
+        lcd.print("   "); // Limpiamos residuos
         
         lcd.setCursor(0, 1);
         lcd.print("N:");
@@ -288,96 +304,92 @@ void loop() {
 
     } else {
         // LCD en Modo 1: Historico de muestras
-        // Leemos directamente del buffer RAM que cargamos al entrar al modo.
-        // Esto garantiza ESTABILIDAD (Snapshot) y RAPIDEZ.
+        // Leemos del buffer RAM que cargamos al entrar al modo, lo cual garantiza estabilidad (Snapshot) y velocidad
         
+        // historial_ram esta lleno de las 10 structs "Muestra" con cada struct conteniendo sus 3 campos, le decimos dame la struct del historial_ram que contenga el indice_historial (supongamos q indice_historial es 5, me da la struct 5 completa y la guardo en datos_historicos)
+        //indice_historial es la posicion del vector historial_ram a la q quiero acceder
         Muestra datos_historicos = historial_ram[indice_historial];
 
         lcd.setCursor(0, 0);
-        lcd.print("R:-");             // R:-X indica "X muestras atrás"
+        lcd.print("R:-");             // R:-X indica "X muestras atras"
         lcd.print(indice_historial);  // 0 a 9
-        lcd.print(" T:");             // 3 chars
-        lcd.print(datos_historicos.t); // 2-3 chars
-        lcd.print("C");               // 1 char -> Total ~10-11 chars (Entra en 16)
+        lcd.print(" T:");
+        lcd.print(datos_historicos.t);
+        lcd.print("°C");
         
         lcd.setCursor(0, 1);
-        lcd.print("L:");              // 2 chars
-        lcd.print(datos_historicos.l); // 1-4 chars
-        lcd.print(" N:");             // 3 chars
-        lcd.print(datos_historicos.n); // 1-4 chars
+        lcd.print("L:");
+        lcd.print(datos_historicos.l);
+        lcd.print(" N:");
+        lcd.print(datos_historicos.n);
     }
     
-    // Retardo para no saturar la comunicación I2C (POSIBLEMENTE CAMBIAR A FUNCION MILLIS)
+    // Retardo para no saturar la comunicación I2C
     delay(200); 
 }
 
 
 
-//INTERRUPCIONES
+//SUBRUTINAS (se ejecutan tras dispararse su interrupcion correspondiente)
 
 //ISR(ADC_vect) - Muestreo Rotativo: esta rutina se ejecuta automaticamente al ocurrir la interrupcion del ADC (la que toma valores y hace la conversion ADC)
-// ISR(ADC_vect) hace la Rotación del Canal para tomar los valores de los 3 sensores uno a la vez (usando un canal analogico para cada sensor)
-// Esta rutina permite que los 3 sensores se actualicen constantemente de fondo/en segundo plano mediante interrupciones ISR sin q el loop haga nada, asi el loop() principal esta libre para manejar otras tareas sin preocuparse por los tiempos de espera de las lecturas de los sensores
+// Hacemos la Rotación del Canal para tomar los valores de los 2 sensores uno a la vez (usando un canal analogico para cada sensor)
+// Esta rutina permite que los 2 sensores se actualicen constantemente de fondo/en segundo plano mediante interrupciones ISR sin q el loop haga nada, asi el loop() esta libre para manejar otras tareas sin preocuparse por los tiempos de espera de las lecturas de los sensores
 
-//La interrupción salta cada vez que se termina de leer UN solo sensor. La configuracion es:
-// Frecuencia del Arduino: 16 MHz con Prescaler = 128, entonces la velocidad del ADC es de 125 kHz (16 Mhz / 128). Una conversion toma 13 ciclos de ese tiempo, entonces tiempo de conversion = 13 * 125 Khz = 104 uS
-// Por lo tanto la funcion ISR(ADC_vect) se ejecuta cada 104 uS (aprox. 9600 veces por segundo)
-// La interrupción salta después de leer UN SOLO sensor. Funciona así:
-// Termina conversion sensor 0 -> INTERRUPCIÓN -> Guardas valor 0 -> Cambias multiplexor al 1, pasan 104 µs
-// Termina conversión sensor 1 -> INTERRUPCIÓN -> Guardas valor 1 -> Cambias multiplexor al 2, pasan 104 µs
-// Termina conversión sensor 2 -> INTERRUPCIÓN -> Guardas valor 2 -> Cambias multiplexor al 0, pasan 104 µs
-// ISR ADC: Muestreo de sensores analogicos (SOLO LUZ y NIVEL)
+//La interrupción ocurre cada vez que se termina de leer UN SOLO sensor. La configuracion es:
+// Frecuencia del Arduino: 16 MHz con Prescaler = 128, entonces la velocidad del ADC es de 125 kHz (16 Mhz / 128). Una conversion toma 13 ciclos de ese tiempo, entonces tiempo de conversion = 13/125 Khz = 104 uS. Por lo tanto la funcion ISR(ADC_vect) se ejecuta cada 104 uS (aprox 9600 veces por s)
+// La interrupcion Funciona así:
+// Termina conversión sensor 1 -> INTERRUPCIÓN -> Guarda valor 1 -> Cambia multiplexor al 2, pasan 104 µs
+// Termina conversión sensor 2 -> INTERRUPCIÓN -> Guardas valor 2 -> Cambias multiplexor al 1, pasan 104 µs
 ISR(ADC_vect) {
+    //ADC es un registro que almacena el valor leido del sensor analogico
     uint16_t lectura = ADC;
     
-    // Asignación DIRECTA: Lo que leo del canal X va al índice X
+    // Guardamos el valor leido del sensor analogico, en el array "valores_sensores" en su indice correspondiente
     valores_sensores[canal_actual_adc] = lectura;
     
-    // Alternar solo entre Canal 1 (Luz) y Canal 2 (Nivel)
+    // Alternar entre Canal 1 (Luz) y Canal 2 (Nivel), el canal 0 de Temp esta en el loop. Arduino tiene 1 solo ADC por lo q para leer mas de un sensor, hay q usar canales distintos conectados al ADC
     if (canal_actual_adc == 1) {
-        canal_actual_adc = 2; // Siguiente: Canal 2
+        canal_actual_adc = 2; // Cambia a Canal 2
     } else {
-        canal_actual_adc = 1; // Siguiente: Canal 1
+        canal_actual_adc = 1; // Cambia a Canal 1
     }
     
-    // Configurar multiplexor para la PRÓXIMA conversión
+    // Hacemos el cambio de canal en el ADC (& 0xF8: desconecta el cable anterior. | canal: conecta el cable nuevo)
     ADMUX = (ADMUX & 0xF8) | canal_actual_adc;
 }
 
 //ISR TIMER1: Logica de Alarma, Buzzer Temporizado y Debounce
 ISR(TIMER1_COMPA_vect) {
-    static uint16_t contador_1s = 0; // uint16_t para contar hasta 400 ms
+    static uint16_t contador_3s = 0; //para contar hasta 3000 ms
     static uint8_t contador_parpadeo = 0;
     
-    // Decrementar contador de debounce si está activo
+    // Decrementar contador de debounce (antirebote) si está activo
     if (contador_debounce > 0) {
         contador_debounce--;
     }
 
-    uint16_t temp = valores_sensores[0];
+    uint16_t temp = valores_sensores[0]; // D7 (Temp)
     uint16_t luz  = valores_sensores[1]; // A1 (Luz)
     uint16_t nivel = valores_sensores[2]; // A2 (Nivel)
     
     // 0: Normal, 1: Advertencia, 2: Alerta
-    uint8_t estado = 0; 
-
-    // Chequeo de condiciones (Prioridad: Alerta > Advertencia > Normal)
+    uint8_t estado = 0;
     
     // Chequeo de Advertencias
     if (temp > TEMP_ADVERTENCIA) estado = 1;
-    if (luz > LUZ_ADVERTENCIA) estado = 1;    // Luz alta es el problema (> 600)
+    if (luz > LUZ_ADVERTENCIA) estado = 1;
     if (nivel > NIVEL_ADVERTENCIA) estado = 1;
 
     // Chequeo de Alertas (sobrescribe advertencia)
     if (temp > TEMP_ALERTA) estado = 2;
-    if (luz > LUZ_ALERTA) estado = 2;         // Luz muy alta es alerta (> 800)
+    if (luz > LUZ_ALERTA) estado = 2;
     if (nivel > NIVEL_ALERTA) estado = 2;
 
-    estado_sistema = estado; // Actualizamos variable global para el LCD
-    alarma_activa = (estado == 2); 
+    estado_sistema = estado; // Actualizamos variable global "estado_sistema" para el LCD
+    alarma_activa = (estado == 2); // si estado == 2 es true, alarma_activa = True, sino False
     
-    // LÓGICA DE BUZZER CON LATCH (Memoria de 15 segundos)
-    // Si se dispara la alarma (estado 2) y no estaba contando, inicia la cuenta.
+    // LOGICA DE BUZZER CON LATCH (Memoria de 15 segundos). Si se dispara la alarma (estado 2) y no estaba contando, inicia la cuenta
     if (estado == 2 && contador_tiempo_buzzer == 0) {
         contador_tiempo_buzzer = 1; 
     }
@@ -395,16 +407,17 @@ ISR(TIMER1_COMPA_vect) {
         // Estado 0 (Reposo) o 1501 (Apagado) -> Buzzer Apagado
         buzzer_encendido = false;
         
-        // Reset del Latch: Solo si la alarma SE FUE (estado != 2) y ya habíamos terminado (1501)
-        // permitimos volver a 0 para que una futura alarma vuelva a sonar.
+        // Reset del Latch: Solo si la alarma SE FUE (estado != 2) y ya habíamos terminado (1501) permitimos volver a 0 para que una futura alarma vuelva a sonar.
         if (estado != 2 && contador_tiempo_buzzer == 1501) {
             contador_tiempo_buzzer = 0;
         }
     }
     
-    // Control de Hardware (LEDs y Buzzer)
-    // D4 (OK), D5 (Alerta), D6 (Buzzer)
-    
+// CONTROL DE HARDWARE (LEDs y Buzzer)
+//PORTD es el "Tablero de Interruptores" de los pines digitales 0 al 7. Escribir un 1 aca es poner ese pin en HIGH, escribir un 0 significa ponerlo en LOW
+// Si el contador es menor a 25 (0-250ms) -> PRENDO. Si es mayor (250-500ms) -> APAGO". Asi parpadea el LED rojo
+// 1 << PORTD4 (LED Amarillo en D4) PORTD4 es el numero 4 entonces es 1 << 4 lo cual crea la mascara 00010000 y al hacer la asignacion |=  "OR" estamos comparando el PORTD con la mascara q creamos (esto para no borrar el valor que ya estaba en PORTD, si hicieramos PORTD = (1 << 4) perderiamos el valor de los demas pines digitales que ya estaban en el registro PORTD, al hacer el OR solo modificamos el valor del pin 4 (Amarillo) y mantenemos los demas valores iguales ya q compara los bits con el OR
+// PORTD &= ~(1 << PORTD5) PORTD5 es el numero 5 entonces queda PORTD &= ~(1 << 5) lo cual genera la mascara 00100000 al correr el bit "1" 5 posiciones. "~" da vuelta la mascara 00100000 a 11011111, luego al hacer la asignacion & "AND" entre esta mascara y el PORTD, obtenemos el mismo PORTD pero con el bit 5 en "0" (lo cual corresponde al PORTD5 q es el del LED Rojo y asi lo ponemos en LOW)  
     contador_parpadeo++;
     if (contador_parpadeo >= 50) contador_parpadeo = 0; 
 
@@ -418,13 +431,13 @@ ISR(TIMER1_COMPA_vect) {
 
     switch (estado) {
         case 0: // NORMAL
-            PORTD |= (1 << PORTD4);  // Amarillo ON
-            PORTD &= ~(1 << PORTD5); // Rojo OFF
+            PORTD |= (1 << PORTD4);  // Amarillo encendido
+            PORTD &= ~(1 << PORTD5); // Rojo apagado
             break;
             
         case 1: // ADVERTENCIA
-            PORTD |= (1 << PORTD4);  // Amarillo ON
-            // Rojo Parpadea
+            PORTD |= (1 << PORTD4);  // Amarillo encendido
+            // Rojo parpadea
             if (contador_parpadeo < 25) {
                 PORTD |= (1 << PORTD5);
             } else {
@@ -433,42 +446,37 @@ ISR(TIMER1_COMPA_vect) {
             break;
             
         case 2: // ALERTA
-            PORTD &= ~(1 << PORTD4); // Amarillo OFF
-            PORTD |= (1 << PORTD5);  // Rojo ON
+            PORTD &= ~(1 << PORTD4); // Amarillo apagado
+            PORTD |= (1 << PORTD5);  // Rojo encendido
             break;
     }
     
-    // LOGICA DE GUARDADO EN EEPROM cada 30 segundos
-    // Cada 3000 llamadas (10ms * 3000 = 30s)
-    contador_1s++;
-    if (contador_1s >= 3000) {
-        contador_1s = 0;
+    // LOGICA DE GUARDADO EN EEPROM cada 30 segundos - Cada 3000 ticks/llamadas (10ms * 3000 = 30s)
+    contador_3s++;
+    if (contador_3s >= 3000) {
+        contador_3s = 0;
         guardar_eeprom = true;
     }
 }
 
 
 
-// ISR PCINT0 - Boton (D8): cuando apretamos el boton, cambia el estado de silencio y el modo LCD pasa de 0 a 1 donde muestra los valores historicos de las muestras (cada vez q apretamos el boton nos movemos hasta el registro 10 y cuando llega a ese, al apretar el boton otra vez se cambia el modo LCD a 0 y se vuelve al modo Tiempo Real mostrando los valores actuales de los sensores)
-// La lectura inicial en el modo historico comienza mostrando la ultima muestra guardada (la de hace 1 segundo. Esto es porque inicializamos "history_index" para apuntar un lugar antes de donde se guardara la siguiente muestra
+// ISR PCINT0 - Boton (D8): cuando apretamos el boton el modo LCD pasa de 0 a 1 donde muestra los valores historicos de las muestras (cada vez q apretamos el boton nos movemos 1 registro desde el 1 al 10 y cuando llegamos a ese, al apretar el boton otra vez se cambia el modo LCD a 0 y se vuelve al modo Tiempo Real)
+// La lectura del primer registro en el modo historico comienza mostrando la ultima muestra guardada (la de hace 4 segundos. Esto es porque inicializamos "indice_eeprom" para apuntar un lugar antes de donde se guardara la siguiente muestra
+//PCINT0_vect significa Pin Change Interrupt 0 Vector, detecta el cambio de Voltaje en e pin y ahi ejecuta la alarma/evento. Es el "ID" del evento (le dice al Arduino, ejecuta esta funcion cuando se dispare la alarma del Grupo 0 (algun cambio de Voltaje en pines D8-D13)
+// El fabricante del chip reservo una dirección fija en memoria (dirección 0x0004) llamada "Vector PCINT0". Cuando el hardware detecta el evento (el cambio de V en pines D8-D13), salta a la dirección 0x0004. La palabra ISR(PCINT0_vect) es una orden al compilador de poner el codigo de esta función exactamente en la dirección 0x0004
 ISR(PCINT0_vect) {
-    // Verificar si el debounce permite una nueva pulsación
+    // Verificar si el antirebote permite una nueva pulsacion del boton
     if (contador_debounce == 0) {
-        // Chequear si el pin está realmente en el estado activo (Asumiendo activo ALTO por defecto o cambio de estado)
-        // Como es interrupción por cambio (Change), entra al soltar y al apretar.
-        // Si el usuario tiene pull-down (boton a VCC): leer 1 es presionado
-        // Si el usuario tiene pull-up (boton a GND): leer 0 es presionado
-        // Vamos a asumir que detectamos el cambio y actuamos, pero bloqueamos por un tiempo.
-        // Simplemente actuamos ante el evento y bloqueamos.
         
-        // Seteamos tiempo de bloqueo (200ms aprox)
+        // Seteamos tiempo de bloqueo (200ms)
         contador_debounce = TIEMPO_DEBOUNCE;
         
-        // Lógica de navegación del LCD
+        // Logica de navegacion de la LCD
         if (modo_lcd == 0) {
-            modo_lcd = 1; // Ir a histórico
-            indice_snapshot = indice_eeprom; // CONGELAR el estado actual para la visualización
-            indice_historial = 0; // Mostrar la más reciente (0 pasos atrás)
+            modo_lcd = 1; // Ir a historico
+            indice_snapshot = indice_eeprom; // CONGELAR el estado actual para la visualizacion
+            indice_historial = 0; // Mostrar la muestra mas reciente (0 pasos atras)
         } else {
             // Estamos en histórico, retrocedemos una muestra
             indice_historial++;
