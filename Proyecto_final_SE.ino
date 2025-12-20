@@ -143,6 +143,20 @@ void timer1_init() {
 
 
 
+
+// Inicializamos Timer2 para generar el tono del Buzzer (Buzzer Pasivo)
+// Configuración: CTC Mode, Prescaler 64
+// Frecuencia objetivo: ~1kHz (2kHz toggle)
+// 16MHz / 64 = 250kHz -> 250 ticks = 1ms. Queremos 0.5ms (500us) para togglear -> 125 ticks.
+void timer2_init() {
+    TCCR2A = (1 << WGM21); // CTC Mode
+    TCCR2B = (1 << CS22);  // Prescaler 64
+    OCR2A = 125;           // Valor de comparación
+    TIMSK2 = 0;            // Arranca silenciado (Interrupción apagada)
+}
+
+
+
 // Interrupción EXTERNA REALIZADA POR BOTON/PULSADOR - por cambio de estado en el pin D8 (PCINT0)
 // Esta funcion se usa para detectar el botón en el pin digital 8 (Puerto B, bit 0)
 // El registro PCMSK0 tiene 8 bits y controla D8 al D13, el bit 0 de ese registro, corresponde al D8
@@ -185,6 +199,7 @@ void setup() {
     // Inicializamos las interrupciones
     adc_init();
     timer1_init();
+    timer2_init(); // Inicializamos Timer del Buzzer
     pcint_init();
 
     sei(); // Habilitamos interrupciones (Hasta que no ejecutamos sei(), las interrupciones estan "muteadas" aunque esten configuradas. Al ejecutar sei(), damos permiso al CPU para que atienda a las interrupciones)
@@ -297,7 +312,7 @@ void loop() {
         if (estado_sistema == 2) {
             lcd.print("ALERTA!!!");
         } else if (estado_sistema == 1) {
-            lcd.print("Warning");
+            lcd.print("Aviso");
         } else {
             lcd.print("OK      "); 
         }
@@ -416,27 +431,31 @@ ISR(TIMER1_COMPA_vect) {
 // CONTROL DE HARDWARE (LEDs y Buzzer)
 //PORTD es el "Tablero de Interruptores" de los pines digitales 0 al 7. Escribir un 1 aca es poner ese pin en HIGH, escribir un 0 significa ponerlo en LOW
 // Si el contador es menor a 25 (0-250ms) -> PRENDO. Si es mayor (250-500ms) -> APAGO". Asi parpadea el LED rojo
-// 1 << PORTD4 (LED Amarillo en D4) PORTD4 es el numero 4 entonces es 1 << 4 lo cual crea la mascara 00010000 y al hacer la asignacion |=  "OR" estamos comparando el PORTD con la mascara q creamos (esto para no borrar el valor que ya estaba en PORTD, si hicieramos PORTD = (1 << 4) perderiamos el valor de los demas pines digitales que ya estaban en el registro PORTD, al hacer el OR solo modificamos el valor del pin 4 (Amarillo) y mantenemos los demas valores iguales ya q compara los bits con el OR
+// 1 << PORTD4 (LED Verde en D4) PORTD4 es el numero 4 entonces es 1 << 4 lo cual crea la mascara 00010000 y al hacer la asignacion |=  "OR" estamos comparando el PORTD con la mascara q creamos (esto para no borrar el valor que ya estaba en PORTD, si hicieramos PORTD = (1 << 4) perderiamos el valor de los demas pines digitales que ya estaban en el registro PORTD, al hacer el OR solo modificamos el valor del pin 4 (Verde) y mantenemos los demas valores iguales ya q compara los bits con el OR
 // PORTD &= ~(1 << PORTD5) PORTD5 es el numero 5 entonces queda PORTD &= ~(1 << 5) lo cual genera la mascara 00100000 al correr el bit "1" 5 posiciones. "~" da vuelta la mascara 00100000 a 11011111, luego al hacer la asignacion & "AND" entre esta mascara y el PORTD, obtenemos el mismo PORTD pero con el bit 5 en "0" (lo cual corresponde al PORTD5 q es el del LED Rojo y asi lo ponemos en LOW)  
     contador_parpadeo++;
     if (contador_parpadeo >= 50) contador_parpadeo = 0; 
 
     // Apagar todo por defecto para setear segun estado
     // Buzzer se controla por la variable 'buzzer_encendido' derivada del latch
+    // Buzzer se controla habilitando/deshabilitando la interrupcion del Timer2 (que genera el tono)
     if (buzzer_encendido) {
-        PORTD |= (1 << PORTD6);
+        // Habilitamos la interrupcion del Timer2 (suena)
+        TIMSK2 |= (1 << OCIE2A);
     } else {
+        // Deshabilitamos la interrupcion del Timer2 (silencio) y aseguramos pin LOW
+        TIMSK2 &= ~(1 << OCIE2A);
         PORTD &= ~(1 << PORTD6);
     }
 
     switch (estado) {
         case 0: // NORMAL
-            PORTD |= (1 << PORTD4);  // Amarillo encendido
+            PORTD |= (1 << PORTD4);  // Verde encendido
             PORTD &= ~(1 << PORTD5); // Rojo apagado
             break;
             
         case 1: // ADVERTENCIA
-            PORTD |= (1 << PORTD4);  // Amarillo encendido
+            PORTD |= (1 << PORTD4);  // Verde encendido
             // Rojo parpadea
             if (contador_parpadeo < 25) {
                 PORTD |= (1 << PORTD5);
@@ -446,7 +465,7 @@ ISR(TIMER1_COMPA_vect) {
             break;
             
         case 2: // ALERTA
-            PORTD &= ~(1 << PORTD4); // Amarillo apagado
+            PORTD |= (1 << PORTD4); // Verde encendido
             PORTD |= (1 << PORTD5);  // Rojo encendido
             break;
     }
@@ -459,6 +478,13 @@ ISR(TIMER1_COMPA_vect) {
     }
 }
 
+
+
+// ISR TIMER2: Generación de onda cuadrada para Buzzer Pasivo
+// Se ejecuta cada 0.5ms aprox para invertir el estado del pin
+ISR(TIMER2_COMPA_vect) {
+    PORTD ^= (1 << PORTD6); // Toggle (Invertir) pin D6
+}
 
 
 // ISR PCINT0 - Boton (D8): cuando apretamos el boton el modo LCD pasa de 0 a 1 donde muestra los valores historicos de las muestras (cada vez q apretamos el boton nos movemos 1 registro desde el 1 al 10 y cuando llegamos a ese, al apretar el boton otra vez se cambia el modo LCD a 0 y se vuelve al modo Tiempo Real)
